@@ -13,14 +13,16 @@ any of its GPU checks):
      FT_GRID, so the next change of the engine's grid cannot leave a copy behind.
 
 usage: python check_grid.py [--engine-header PATH] [--trainer PATH]
-       (defaults: src/nnue_kernels.h and nnue/openi_upload/resident_train.py of this checkout)"""
+       (defaults: $NNUE_ENGINE_HEADER, else src/nnue_kernels.h of a Luminex checkout beside this repository;
+        resident_train.py beside this file. CI fetches the header from Luminex main.)"""
 import argparse
 import os
 import re
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-HEADER = os.path.join(os.path.dirname(os.path.dirname(HERE)), "src", "nnue_kernels.h")
+HEADER = os.environ.get("NNUE_ENGINE_HEADER") or os.path.join(
+    os.path.dirname(os.path.dirname(HERE)), "Luminex", "src", "nnue_kernels.h")
 TRAINER = os.path.join(HERE, "resident_train.py")
 NUM = r"([0-9]+(?:\.[0-9]*)?(?:[eE][+-]?[0-9]+)?)"
 GRID_LITERAL = re.compile(r"torch\.round\([^\n]*?[*/]\s*(?:1024|2048|4096|8192|16384|32768)(?:\.0*)?\b")
