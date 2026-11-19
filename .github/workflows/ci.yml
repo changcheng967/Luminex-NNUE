@@ -1,0 +1,46 @@
+name: Checks
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  # Daily too: the engine's grid can change without a push here.
+  schedule:
+    - cron: "23 5 * * *"
+  workflow_dispatch:
+
+env:
+  # nnue-pytorch's binpack reader, at the commit binpack2lcr was verified with (the box cells pin it too).
+  NP_COMMIT: ed84cc1fd2255faa0f33dcfa7839c9b6b4bb49b8
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v5
+    # The trainer's QAT grid (FT_GRID) must be the engine's NNUE_FT_SCALE: a change to either alone fails here,
+    # not in a network trained on the wrong grid weeks later.
+    - name: Fetch the engine's grid header from Luminex main
+      run: curl -fsSL --retry 5 -o "$RUNNER_TEMP/nnue_kernels.h" https://raw.githubusercontent.com/changcheng967/Luminex/main/src/nnue_kernels.h
+    - name: Check the trainer's feature grid against the engine's
+      run: python3 trainer/check_grid.py --engine-header "$RUNNER_TEMP/nnue_kernels.h"
+    - name: Compile the Python tools
+      run: python3 -m py_compile trainer/*.py forensics/*.py
+    - name: Parse the bot script
+      run: bash -n bot/start_luminexbot.sh
+    - name: Fetch nnue-pytorch's binpack reader
+      run: |
+        mkdir -p "$RUNNER_TEMP/nnue-pytorch"
+        curl -fsSL --retry 5 "https://codeload.github.com/official-stockfish/nnue-pytorch/tar.gz/$NP_COMMIT" \
+          | tar xz -C "$RUNNER_TEMP/nnue-pytorch" --strip-components=1
+        test -f "$RUNNER_TEMP/nnue-pytorch/data_loader/cpp/lib/binpack.h"
+    - name: Build the C++ tools as the trainer and the cells build them
+      run: |
+        dpkg -s libzstd-dev > /dev/null 2>&1 || { sudo apt-get update -q && sudo apt-get install -y -q libzstd-dev; }
+        inc="$RUNNER_TEMP/nnue-pytorch/data_loader/cpp"; out="$RUNNER_TEMP/bin"; mkdir -p "$out"
+        g++ -O3 -march=native -shared -fPIC -pthread trainer/feeder.cpp -o "$out/libfeeder.so"
+        g++ -O3 -march=native -std=c++20 -shared -fPIC -pthread -I "$inc" trainer/binfeed.cpp -o "$out/libbinfeed.so"
+        g++ -O2 -std=c++20 -pthread -I "$inc" -o "$out/binpack2lcr" trainer/binpack2lcr.cpp
+        g++ -O2 -std=c++20 -I "$inc" -o "$out/lgs2lcr" trainer/lgs2lcr.cpp -lzstd
+        g++ -O2 -std=c++20 -I "$inc" -o "$out/sf_binpack_dump" trainer/sf_binpack_dump.cpp -lzstd

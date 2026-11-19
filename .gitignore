@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+
+# The feeders and tools built next to their sources
+*.so
+*.o
+trainer/nnue-pytorch/
+
+# Data, networks and run output stay out of the repository
+*.nnue
+*.pt
+*.lcr
+*.binpack
+*.log
