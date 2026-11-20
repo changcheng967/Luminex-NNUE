@@ -49,7 +49,7 @@
 
 namespace {
 
-struct CompactRec {   // src/featurize.cpp CompactRec, as binpack2lcr.cpp writes it
+struct CompactRec {   // src/tools.cpp (luminex-featurize) CompactRec, as binpack2lcr.cpp writes it
     std::uint64_t occ;
     std::uint8_t pcs[16];
     std::int16_t target;

@@ -432,7 +432,7 @@ class LNNUE(nn.Module):
 # ============================================================================
 LOSS_SCALE = 400.0     # cp per sigmoid unit in the loss
 TARGET_CLIP = 1500.0   # |target| cap (mate scores, parse glitches)
-# Featurizer record (src/featurize.cpp), 140 bytes:
+# Featurizer record (src/tools.cpp, luminex-featurize), 140 bytes:
 #   int16 w[32] | int16 b[32] | f32 stm (1 = white) | f32 target (stm-relative cp)
 #   | f32 flag (fen-eval: 0 quiet, 1 capture-best, 2 in-check; gamepack: result)
 REC = 140
