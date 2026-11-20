@@ -1140,7 +1140,7 @@ class FusedFT(torch.autograd.Function):
     @staticmethod
     def forward(ctx, wf, bf, weight):
         n, L1 = wf.shape[0], weight.shape[1]
-        planes_s, order, rf, rb = ft_sorted_rows(wf, bf)
+        planes_s, order, rf, rb, _ = ft_sorted_rows(wf, bf)
         out_s = ft_sums(planes_s, rf, weight, torch.zeros(L1, dtype=torch.float32, device=wf.device))
         out = torch.empty_like(out_s)
         out[order] = out_s                     # back to side-row order: White 0..n-1, Black n..2n-1
@@ -1154,13 +1154,15 @@ class FusedFT(torch.autograd.Function):
         return None, None, ft_weight_grad(planes_s, rb, torch.cat([gw, gb])[order], ctx.nrows)
 
 
-def ft_sorted_rows(wf, bf):
+def ft_sorted_rows(wf, bf, stm=None, L1=0):
     """The fused kernels' inputs: side-rows' bitboards sorted by king bucket (planes_s), the
-    sort (order: sorted slot -> side-row) and the forward's and backward's ranges."""
-    planes, kb = FF.side_rows(wf, bf, NUM_INPUTS)   # 0.9 ms; rec_bitboards is exact but 4.1 ms until fixed
-    order, rf = FF.plan(kb, FUSED_FWD['BM'])
-    rb = FF.plan(kb, FUSED_CH)[1]
-    return planes[order].contiguous(), order, rf, rb
+    sort (order: sorted slot -> side-row), the forward's and backward's ranges and, given stm,
+    each sorted side-row's row in h (FF.act_dst). One pass without a host sync
+    (FF.sorted_side_rows): the step-by-step side_rows + plan + plan + planes[order] + act_dst
+    gave the same integers in 1.83 ms at n = 131,072, this takes 0.45."""
+    planes_s, order, (rf, rb), dst = FF.sorted_side_rows(wf, bf, NUM_INPUTS, (FUSED_FWD['BM'], FUSED_CH),
+                                                         stm, L1)
+    return planes_s, order, rf, rb, dst
 
 
 def ft_sums(planes_s, rf, weight, bias, act=None):
@@ -1197,8 +1199,7 @@ class FusedAct(torch.autograd.Function):
     def forward(ctx, wf, bf, weight, bias, stm):
         ctx.set_materialize_grads(False)
         n, L1 = wf.shape[0], weight.shape[1]
-        planes_s, order, rf, rb = ft_sorted_rows(wf, bf)
-        dst = FF.act_dst(order, stm, n, L1)
+        planes_s, order, rf, rb, dst = ft_sorted_rows(wf, bf, stm, L1)
         sums, h = ft_sums(planes_s, rf, weight, bias, act=(dst, n))
         ctx.save_for_backward(planes_s, rb, dst, sums, bias)
         ctx.nrows = weight.shape[0]
