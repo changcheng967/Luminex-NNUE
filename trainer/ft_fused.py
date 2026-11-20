@@ -347,3 +347,70 @@ def fp8_rows(g):
     boost = torch.exp2(d)
     g8 = (g.float() * (S * boost)[:, None]).to(torch.float8_e4m3fn).contiguous()
     return g8, (1.0 / boost).float().contiguous(), float(1.0 / S)
+
+
+# ---------------------------------------------------------------------------
+# side_rows + plan + planes[order] + act_dst in one pass. The step-by-step versions above ran ~25 eager int64
+# kernels a step on [2n, 32] tensors (cat, remainder, shifts, divisions, where, scatter_add_, two int64 argsorts,
+# two bincounts that each synced with the host, the planes' gather into sorted order, the rows in h): 1.83 ms of
+# GPU time at n = 131,072. sorted_side_rows() returns the same integers in 0.45 ms: one stable sort on 8-bit keys
+# (a stable sort's order depends only on the keys' order), the buckets' sizes from the sorted keys (no host sync,
+# no atomics), every block size's ranges from that one sort, and one kernel that builds each sorted slot's 12
+# planes from its side-row's features (integer sums, as scatter_add_ adds them) and its row in h.
+@triton.jit
+def _sorted_planes(wf, bf, order, stm, planes, dst, n, R, num_inputs, L1,
+                   DST: tl.constexpr, BLOCK: tl.constexpr, PSQ_C: tl.constexpr):
+    s = (tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)).to(tl.int64)
+    m = s < R
+    row = tl.load(order + s, mask=m, other=0).to(tl.int64)
+    black = row >= n
+    p = tl.where(black, row - n, row)
+    offs = p[:, None] * 32 + tl.arange(0, 32)[None, :]
+    fw = tl.load(wf + offs, mask=(m & (black == 0))[:, None], other=0).to(tl.int64)
+    fb = tl.load(bf + offs, mask=(m & black)[:, None], other=0).to(tl.int64)
+    f = tl.where(black[:, None], fb, fw)
+    valid = f < num_inputs
+    local = f % PSQ_C
+    bit = tl.where(valid, tl.full(f.shape, 1, tl.int64) << (local % 64), 0)
+    pl = tl.where(valid, local // 64, 0)
+    for q in tl.static_range(12):
+        tl.store(planes + s * 12 + q, tl.sum(tl.where(pl == q, bit, 0), axis=1), mask=m)
+    if DST:
+        sv = tl.load(stm + p, mask=m, other=0.0)
+        half = tl.where(sv > 0.5, black, black == 0)
+        tl.store(dst + s, p * (2 * L1) + half.to(tl.int64) * L1, mask=m)
+
+
+def plan_ranges(counts, R, block, nkb=NKB):
+    """plan()'s ranges [R // block + nkb, 3] int32 from the bucket counts: the same arithmetic."""
+    dv = counts.device
+    starts = torch.cumsum(counts, 0) - counts
+    nr = (counts + block - 1) // block
+    rend = torch.cumsum(nr, 0)
+    t = torch.arange(R // block + nkb, device=dv)
+    b = torch.searchsorted(rend, t, right=True)
+    ok = b < nkb
+    bc = b.clamp(max=nkb - 1)
+    s = starts[bc] + (t - (rend[bc] - nr[bc])) * block
+    e = torch.minimum(s + block, starts[bc] + counts[bc])
+    return torch.stack([torch.where(ok, s, 0), torch.where(ok, e, 0), bc], 1).to(torch.int32).contiguous()
+
+
+def sorted_side_rows(wf, bf, num_inputs, blocks, stm=None, L1=0, BLOCK=128):
+    """side_rows(wf, bf) sorted by bucket, with what the kernels need, without a host sync: (planes_s [2n, 24]
+    int32 in sorted order, order [2n] int64, [plan(kb, b)[1] for b in blocks], dst [2n] int64 = act_dst(order,
+    stm, n, L1), or None without stm). Every value equals the step-by-step versions'."""
+    n, dv = wf.shape[0], wf.device
+    R = 2 * n
+    wf, bf = wf.contiguous(), bf.contiguous()
+    kb = torch.cat([wf[:, 0], bf[:, 0]]) // PSQ           # slot 0 always holds a piece; all of a side-row's
+    kb_s, order = torch.sort(kb.to(torch.uint8), stable=True)   # features lie in one bucket (< NKB = 32)
+    edges = torch.searchsorted(kb_s, torch.arange(NKB + 1, dtype=torch.uint8, device=dv))
+    counts = edges[1:] - edges[:-1]                       # the buckets' sizes, from the sorted keys
+    ranges = [plan_ranges(counts, R, b) for b in blocks]
+    planes = torch.empty(R, 12, dtype=torch.int64, device=dv)
+    dst = torch.empty(R, dtype=torch.int64, device=dv) if stm is not None else None
+    _sorted_planes[(triton.cdiv(R, BLOCK),)](wf, bf, order, stm if stm is not None else wf, planes,
+                                             dst if dst is not None else planes, n, R, num_inputs, L1,
+                                             DST=stm is not None, BLOCK=BLOCK, PSQ_C=PSQ)
+    return planes.view(torch.int32), order, ranges, dst
