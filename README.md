@@ -4,7 +4,7 @@ The training side of the [Luminex](https://github.com/changcheng967/Luminex) che
 makes its NNUE networks, the data tools that feed it, network forensics, and the development log.
 
 The engine repository keeps what builds and ships the engine: the search, the evaluation, the network reader,
-and the specification of every network format (its `docs/nnue/`). Networks trained here are written in the
+and the specification of every network format (its `docs/NNUE.md`). Networks trained here are written in the
 formats those specifications define. `src/...` in comments here means the engine repository's `src/`.
 
 ## Layout

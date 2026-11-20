@@ -10,8 +10,8 @@
 // whose score is VALUE_NONE (32002): that is how a producer marks a position to
 // skip (nnue-pytorch's loader skips them too), so it is counted and left out.
 //
-// Record (src/featurize.cpp CompactRec): occupancy u64 | the pieces of the
-// occupied squares in ascending order as 4-bit codes (src/types.h Piece:
+// Record (src/tools.cpp, luminex-featurize: CompactRec): occupancy u64 | the pieces of the
+// occupied squares in ascending order as 4-bit codes (src/luminex.h Piece:
 // WHITE_PAWN = 0 .. BLACK_KING = 11) | i16 side-to-move-relative score |
 // u8 flags (bit 0 white to move, bits 1-2: 0 quiet, 1 capture-best,
 // 2 in-check, bit 3 game result known, bits 4-5 the game's result for the side

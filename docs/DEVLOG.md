@@ -6,7 +6,7 @@ generation to the V13/V14 architecture program. Dates are first-commit dates fro
 This log moved here from the engine repository's `nnue/DEVLOG.md` when the training tools got their own
 repository. Paths in the entries are the engine repository's of their day: `nnue/openi_upload/` is this
 repository's `trainer/` and `nnue/forensics/` its `forensics/`; `src/` and the network specs (`nnue/V*.md`,
-now `docs/nnue/`) are in [changcheng967/Luminex](https://github.com/changcheng967/Luminex), and so are
+now `docs/NNUE.md`) are in [changcheng967/Luminex](https://github.com/changcheng967/Luminex), and so are
 the tools retired before the move, in its history.
 
 ---
@@ -26,8 +26,8 @@ the tools retired before the move, in its history.
 | gen768 p1–p5 | Sep 2026 | same arch, multi-pass training | p4: 4.21B · p5: 5.37B | p4 MAE 176.1 ≈ baseline (saturation signal) |
 | V13 | Sep 2026+ | FM interaction, factorized buckets, material bucketing | — | **Spec complete**; DCU search picking hyperparams |
 | V14 | future | Residual topology + mobility + policy head | — | **Spec complete** |
-| gen768r | Nov 2026 | gen768's feature layer, the revived tail through 8 output buckets; QAT (03q to 06q) | t91 binpacks Feb–Oct 2026 (3.7B); 05: Nov–Dec 2025 + Feb–May 2026 (6.6B); 06: Dec 2025 + Jan + Jun–Oct 2026 (6.0B) | **In main** as gen768r_06q (E3397B0F), the line's last net; [V3-GEN768R.md](https://github.com/changcheng967/Luminex/blob/main/docs/nnue/V3-GEN768R.md) |
-| gen768s | Nov 2026 | gen768r + one error head per bucket on the accumulator, read by the pruning margins | gen768r's + error labels | **Design**, §19 and [V4-GEN768S.md](https://github.com/changcheng967/Luminex/blob/main/docs/nnue/V4-GEN768S.md) |
+| gen768r | Nov 2026 | gen768's feature layer, the revived tail through 8 output buckets; QAT (03q to 06q) | t91 binpacks Feb–Oct 2026 (3.7B); 05: Nov–Dec 2025 + Feb–May 2026 (6.6B); 06: Dec 2025 + Jan + Jun–Oct 2026 (6.0B) | **In main** as gen768r_06q (E3397B0F), the line's last net; [V3-GEN768R](https://github.com/changcheng967/Luminex/blob/main/docs/NNUE.md#v3-gen768r) |
+| gen768s | Nov 2026 | gen768r + one error head per bucket on the accumulator, read by the pruning margins | gen768r's + error labels | **Design**, §19 and [V4-GEN768S](https://github.com/changcheng967/Luminex/blob/main/docs/NNUE.md#v4-gen768s) |
 
 ---
 
@@ -73,11 +73,11 @@ more data — and a standing rule: **no capacity increase without curve evidence
 
 The foundation everything since is built on:
 
-- **[lc0pack](https://github.com/changcheng967/Luminex/blob/main/src/lc0pack.cpp)** — converts Leela v6 selfplay chunks to gamepack frames
+- **[lc0pack](https://github.com/changcheng967/Luminex/blob/main/src/tools.cpp)** — converts Leela v6 selfplay chunks to gamepack frames
   (`[hdr][mv][ev]` format: fen table, 9-byte game entries, u16 raw moves, delta-encoded evals).
-- **[luminex-featurize](https://github.com/changcheng967/Luminex/blob/main/src/featurize.cpp)** — mmap'd, multithreaded C++ featurizer; `--stream` mode emits packed
+- **[luminex-featurize](https://github.com/changcheng967/Luminex/blob/main/src/tools.cpp)** — mmap'd, multithreaded C++ featurizer; `--stream` mode emits packed
   136-byte records; `--fen-eval` mode for text ingestion. Shipped as a prebuilt static binary.
-- **[verify_frames](https://github.com/changcheng967/Luminex/blob/main/src/verify_frames.c)** — exhaustive frame verifier; no corrupt frame ever trains.
+- **[verify_frames](https://github.com/changcheng967/Luminex/blob/main/src/tools.cpp)** — exhaustive frame verifier; no corrupt frame ever trains.
 - **C500 multi-stage streaming trainer** ([`c500_train_stream.py`](https://github.com/changcheng967/Luminex/blob/dc0c83f67225872a032efa758a1223d5fd154bd2/nnue/openi_upload/c500_train_stream.py)) — frame-loop, budget-safe,
   OOM-safe part-splitting for big frames.
 - **Target calibration** — SF18's own NNUE scores only 0.48 R² against d26 targets; the
@@ -154,7 +154,7 @@ accumulator, SCReLU stack, `out × 300` output scaling.
 
 - **Research library** — cross-domain survey (CTR factorization machines, DCN-V2 cross
   layers, JL/RG bounds) validating the V13 design space.
-- **[NNUE Template](https://github.com/changcheng967/Luminex/blob/main/docs/nnue/NNUE%20Template.md)** — the house spec format (7 sections); all architecture specs follow it
+- **[NNUE Template](https://github.com/changcheng967/Luminex/blob/main/docs/NNUE.md#the-template)** — the house spec format (7 sections); all architecture specs follow it
   strictly.
 - **V13 spec** ([`V13.md`](https://github.com/changcheng967/Luminex/blob/ee7054c018ffb4b05ee8ee1a3e38970f4897908d/nnue/V13.md)) — survived 7 machine-verification review rounds. Key ideas:
   FM interaction block (`I_k = ½(S_k² − Q_k)` from per-feature latent vectors, O(1) per
@@ -930,7 +930,7 @@ tree identical up to 6.4M, fixes 2. These are fragile decisions that flip
 with any change to the tree, not a pruning bug; nothing in the search to
 repair, and the lever is the eval at the end of those lines.
 
-**Decisions** (the architecture itself: the engine's docs/nnue/V3-GEN768R.md).
+**Decisions** (the architecture itself: the engine's docs/NNUE.md, V3-GEN768R).
 - *Architecture: gen768r*, the revived tail routed through 8 output buckets,
   the FT unchanged; the cost per eval is one popcount. Most of the loss is
   search-limited, so accuracy must not cost nodes: capacity goes where the
@@ -1103,7 +1103,7 @@ accumulator the eval has already built, so it can estimate the same thing
 for each position from the first node, trained on corpus-scale labels.
 Stockfish's search has no consumer for such an output; it is a lever only
 an engine built around one can pull. The architecture is
-[V4-GEN768S.md](https://github.com/changcheng967/Luminex/blob/main/docs/nnue/V4-GEN768S.md).
+[V4-GEN768S](https://github.com/changcheng967/Luminex/blob/main/docs/NNUE.md#v4-gen768s).
 
 **Speed budget, stated before any code.** Every component quotes its
 measured cost in its PR and pays for it in games.

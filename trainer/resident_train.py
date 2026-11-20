@@ -150,7 +150,7 @@ os.environ.setdefault("NNUE_BUCKETS", "8")
 from luminex_nnue_train import (LNNUE, LOSS_SCALE, NUM_INPUTS,  # noqa: E402
                                 parse_quiet_loss, save_nnue, stm_split_gate)
 
-REC = 32   # LCR1 record bytes (src/featurize.cpp CompactRec)
+REC = 32   # LCR1 record bytes (src/tools.cpp, luminex-featurize: CompactRec)
 
 
 def env(name, default):
@@ -919,7 +919,7 @@ QW_T = torch.tensor(QW, device=dev) if QW is not None else None   # made once: a
 def expand(rec):
     """uint8 [n, 32] LCR1 -> (white idx, black idx, stm, target, flag, pieces).
 
-    Index rule = src/featurize.cpp halfka_idx: square XOR 7 when that side's
+    Index rule = src/tools.cpp (luminex-featurize) halfka_idx: square XOR 7 when that side's
     king is on files a-d, XOR 56 more for black's view; plane = piece type * 2,
     +1 for the other side's pieces; bucket from the oriented king square."""
     n = rec.shape[0]
@@ -1328,7 +1328,7 @@ PROBE = (("Q", "4r1k1/1p3ppp/p7/3Q4/8/1P4P1/P4P1P/3R2K1 w - - 0 30"),      # que
          ("R", "8/8/4k3/8/2R5/8/4K3/8 w - - 0 1"),                        # K+R vs K
          ("Rp", "6k1/5ppp/8/8/8/8/5PPP/3R2K1 w - - 0 1"),                 # rook up with pawns
          ("N", "2r2rk1/pp3ppp/2n1p3/3pP3/3P4/P1N2N2/1P3PPP/2R2RK1 w - - 0 18"))   # knight up
-PIECE = {c: i for i, c in enumerate("PNBRQKpnbrqk")}   # src/types.h Piece: WHITE_PAWN = 0 .. BLACK_KING = 11
+PIECE = {c: i for i, c in enumerate("PNBRQKpnbrqk")}   # src/luminex.h Piece: WHITE_PAWN = 0 .. BLACK_KING = 11
 
 
 def fen_record(fen):
