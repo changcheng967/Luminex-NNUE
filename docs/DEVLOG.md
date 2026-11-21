@@ -1251,3 +1251,41 @@ extends to that schedule.
 millisecond feeds part of its rounding into the estimate. The clamp and the
 1/8 weight bound the damage (a persistent spurious 50 ms costs about 2% of
 the budget), and `TimeLag=0` turns it off.
+
+## 24. The code of the V5 runs, by hash (G7 and G8, Nov 20-22)
+
+The two runs that made gen768t_03 (main's network since changcheng967/Luminex#123) and gen768t_04 ran code that
+lived only on the GPU boxes and in the session notes. `runs/` now holds it byte for byte, so either run can be
+read and repeated from here. Each cell pins every file it uses by SHA-256 and stops on a mismatch; the table gives
+the first 8 hex digits.
+
+| On the box | Comes from | SHA-256 |
+| :--- | :--- | :--- |
+| `/marimo/g7/resident_train_dh_rel.py`, the float phase (it finds `v5/` and `fast/` through `PYTHONPATH`) | `runs/g7/` | d8088c2b |
+| `/marimo/g7/fast/ft_fused.py` | `runs/g7/fast/` | 568a2483 |
+| `/marimo/g7/v5/rel_gate.py`, `rel_kernels.py`, `rel_rows.py` | `runs/g7/v5/` | a83ec76d, 19a1f736, dfe8b379 |
+| `/marimo/g7/binfeed.cpp`, `feeder.cpp` | copied by the cell from `/marimo/tools` | 6b13e164, e01bbbf9 |
+| `/marimo/tools/rel_gate.py`, `rel_kernels.py`, `patch_rel.py`: the QAT phase's relation code, G6's (`NNUE_REL_IMPL=triseg`) | `runs/tools/` | 4a7076fc, ccff545c, 904db2f8 |
+| `/marimo/tools/make_qatstart_v5.py`, `lnt8_from_qat.py` | `runs/tools/` | e78b6a75, 2d29301f |
+| `/marimo/tools/resident_train.py`, `luminex_nnue_train.py`, `ft_fused.py`, `binfeed.cpp`, `feeder.cpp`, `binpack2lcr.cpp`, `quantize_i8.py`, `pfetch.py`, `check_grid.py`, `check_fused.py`, `check_feeder.py` | fetched by the cell from changcheng967/Luminex at 4e76774, `nnue/openi_upload/` (tag `archive/v5-run-tools`) | 210e5972, ea5b94f2, 638f8198, 6b13e164, e01bbbf9, 28f7ec0d, 52811a38, cf24acc2, 09dc2489, e5807730, ece75d31 |
+| `/marimo/tools/quantize_ft8.py` (checked by the cell, not run for V5) | fetched from changcheng967/Luminex at e2bac96, `nnue/openi_upload/quantize_i8.py` (tag `archive/v5-run-ft8`) | 627687a0 |
+| `/marimo/tools/nnue_kernels.h`, for the grid check | changcheng967/Luminex at 4e76774, `src/nnue_kernels.h` | |
+| `/marimo/tools/patch_draw.py`, `patch_rows.py`, `check_sources.py`, `binpack_head.py`, `check_data.py`, `binpack_split.py`, `strip_heads.py`, `fit_heads.py` | written by the cell from its own text (the hashes are G8's) | 42eae073, 861d5e5b, c4090467, b86abb6d, 7f12f0af, 39d85642, b3b666de, 036557fc |
+| `/marimo/data/jantail.000.lcr`, held out: 336,261 positions, one of G5's 20 January-tail files | data, not in this repository | 5acfc7d3 |
+| `/marimo/data/tree.000.lcr`, held out: 585,979 search-tree positions | data, not in this repository | ea4d7eee |
+| `/marimo/tools/nnue-pytorch` | official-stockfish/nnue-pytorch at ed84cc1f | |
+
+The QAT trainer is made on the box: `patch_rows.py` turns `resident_train.py` into `resident_train_qr.py`
+(d98490be), then `patch_rel.py` turns that into `resident_train_qr_rel.py` (e7324f72). Run with those files, the
+two patches give the same bytes again (on Windows, after turning the CRLF endings that Python's text mode writes
+back into LF).
+
+| Run | Cell | Box | Network |
+| :--- | :--- | :--- | :--- |
+| G7, gen768t_03 | `runs/cells/g7a_box6.py` (94da575e) | 6, 2026-11-20/21 | `luminex_gen768t_03q_i8.nnue` (f9caa986), main's net since changcheng967/Luminex#123 |
+| G8, gen768t_04 | `runs/cells/g8_box7.py` (6bfbad0b) | 7, 2026-11-21/22 | `luminex_gen768t_04q_i8.nnue` (d955d5a2), against 03q in OpenBench test 200 (SPRT [0, 5] at 10+0.1) |
+
+`runs/` is a record of what ran: nothing in it is edited. A fix goes into `trainer/`, and the next run's cell pins
+its own files. `trainer/` is the line changcheng967/Luminex#105 brought to main; the float-phase speed-ups the runs
+used (the fused relation lanes and the one-pass feature-layer inputs, open here as #2 and #3, the relation rows
+straight from the records, and the merged draw-head logits) are in `runs/g7/` and not yet in `trainer/`.
