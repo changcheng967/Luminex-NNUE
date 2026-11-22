@@ -33,6 +33,11 @@ Environment:
   NNUE_REL_SEGLIST [0]   trirows/triseg: 1 = seg_grad's join over the rows with two or more pieces only, found
                          without a host sync (rel_kernels._seg_join_list): the same sums
   NNUE_REL_ROWS2 [0]     trirows: 1 = the rows by rel_rows._rel_rows2, the same rows by fewer instructions
+  NNUE_REL_GS16 [0]      trirows, float phase: 1 = the table's gradient from act_bwd's bf16 gs (its lanes 0..T-1 are
+                         bf16 of the fp32 lane gradient, which the feature table's gradient already reads) through
+                         the bucket sort's inverse: no fp32 lane gradient written, half the bytes in _seg_piece.
+                         NOT bit for bit (each lane gradient rounded to bf16 before the table's sums): proven
+                         loss-equal on box 10 (DEVLOG section 26) before any run used it
   NNUE_REL_FUSED [1]     1: on a GPU, indices() as one compiled dense pass (the same rows in the same order);
                          0: the step-by-step version, which the CPU always runs
   NNUE_REL_JOIN [inplace]   how the sums meet the feature layer's lanes: inplace = one autograd function that adds
@@ -603,6 +608,10 @@ def _rel_sums(model, rec):
     return bag_sum(_rows(model), bags, cols, 2 * rec.shape[0], cnt)
 
 
+GS16 = os.environ.get("NNUE_REL_GS16", "0") == "1"   # see lane_sums (the float phase, trirows only)
+GS16_PENDING = []   # (model, rows, cnt, nnz, ev): the batch's rows for FusedAct.backward's rows_grad16
+
+
 @torch.compiler.disable
 def lane_sums():
     """The relation rows' sums [2n, T] fp32 for the records expand() last saw, in the fused kernels' side-row order
@@ -612,7 +621,19 @@ def lane_sums():
     if rec is None:
         raise RuntimeError("rel_gate.lane_sums: a forward() without the expand() of its records")
     with torch.autocast(device_type=rec.device.type, enabled=False):
-        return _clamp(_rel_sums(_CTX["model"], rec))
+        model = _CTX["model"]
+        if GS16 and not _CTX.get("qat") and IMPL == "trirows" and rec.is_cuda and not PPM:
+            # NNUE_REL_GS16: the sums without autograd; FusedAct.backward takes the table's gradient from gs
+            import rel_kernels
+            import rel_rows
+            rows, cnt = rel_rows.rel_rows(rec)
+            with torch.no_grad():
+                out, ctx = rel_kernels.rel_sum_rows_nograd(model.rel, rows, cnt, 2 * rec.shape[0], bf16=TABLE16)
+            if torch.is_grad_enabled():
+                GS16_PENDING.clear()
+                GS16_PENDING.append((model,) + ctx)
+            return out
+        return _clamp(_rel_sums(model, rec))
 
 
 def group(model, lr):

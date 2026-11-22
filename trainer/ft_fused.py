@@ -270,7 +270,8 @@ def _ft_bwd(planes, ranges, g, gscale, dw,
 
 @triton.jit
 def _act_bwd(g, g2, sums, dst, bias, gs, part, lane, order, glane, R,
-             L1: tl.constexpr, BR: tl.constexpr, BC: tl.constexpr, TWO: tl.constexpr, T: tl.constexpr):
+             L1: tl.constexpr, BR: tl.constexpr, BC: tl.constexpr, TWO: tl.constexpr, T: tl.constexpr,
+             GL: tl.constexpr = True):
     pb = tl.program_id(0)
     cb = tl.program_id(1)
     rows = (pb * BR + tl.arange(0, BR)).to(tl.int64)
@@ -288,7 +289,7 @@ def _act_bwd(g, g2, sums, dst, bias, gs, part, lane, order, glane, R,
     c = tl.minimum(tl.maximum(x, 0.0), 1.0)
     gx = tl.where((x >= 0.0) & (x <= 1.0) & rmask[:, None], gv * 2.0 * c, 0.0)   # clamp's mask is inclusive
     tl.store(gs + sp, gx.to(tl.bfloat16), mask=rmask[:, None])
-    if T > 0:   # the lane sums' gradient is the sums' gradient on their lanes, fp32, in side-row order
+    if T > 0 and GL:   # the lane sums' gradient is the sums' gradient on their lanes, fp32, in side-row order
         tl.store(glane + orow[:, None] * T + cols[None, :], gx, mask=lm)
     tl.store(part + pb * L1 + cols, tl.sum(gx, axis=0))
 
@@ -360,7 +361,7 @@ def act_dst(order, stm, n, L1):
     return (p * (2 * L1) + half.long() * L1).contiguous()
 
 
-def act_bwd(g, g2, sums, dst, bias, BR=32, BC=256, num_warps=4, lanes=None):
+def act_bwd(g, g2, sums, dst, bias, BR=32, BC=256, num_warps=4, lanes=None, gl_out=True):
     """Backward of ft_fwd(act=...). g [n, 2 * L1] = dL/dh (bf16 or fp32), g2 = a second
     consumer's dL/dh or None, sums, bias and lanes as ft_fwd took them. Returns (gs, db, gl): gs
     [R, L1] bf16 in sorted order for ft_bwd, the gradient of the sums, db [L1] fp32, the bias's,
@@ -371,12 +372,13 @@ def act_bwd(g, g2, sums, dst, bias, BR=32, BC=256, num_warps=4, lanes=None):
     g = g.contiguous()
     g2 = g2.contiguous() if g2 is not None else None
     gs = torch.empty(R, L1, dtype=torch.bfloat16, device=sums.device)
-    gl = torch.empty(R, T, dtype=torch.float32, device=sums.device) if T else None   # every row is written once
+    # every row is written once; gl_out=False (NNUE_REL_GS16): not written at all, gs's lanes 0..T-1 stand in
+    gl = torch.empty(R, T, dtype=torch.float32, device=sums.device) if T and gl_out else None
     nrb = triton.cdiv(R, BR)
     part = torch.empty(nrb, L1, dtype=torch.float32, device=sums.device)
     _act_bwd[(nrb, L1 // BC)](g, g2 if g2 is not None else g, sums, dst, bias, gs, part,
-                              lane if T else bias, order if T else dst, gl if T else part, R,
-                              L1=L1, BR=BR, BC=BC, TWO=g2 is not None, T=T, num_warps=num_warps)
+                              lane if T else bias, order if T else dst, gl if gl is not None else part, R,
+                              L1=L1, BR=BR, BC=BC, TWO=g2 is not None, T=T, GL=gl is not None, num_warps=num_warps)
     return gs, part.sum(0), gl
 
 
