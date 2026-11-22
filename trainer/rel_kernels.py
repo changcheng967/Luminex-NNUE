@@ -32,9 +32,15 @@ more. The lane block is the grid's slow axis, so the gradient's columns of one l
 4 bytes = 67 MB at the gate's batch) stay in the L2 while every piece gathers from them, as the forward gathers from
 the table. Deterministic; not embedding_bag's order of additions, so equal to it bit for bit only where the sums are
 exact (a gradient of whole multiples of 1/1024), and within rounding elsewhere."""
+import os
+
 import torch
 import triton
 import triton.language as tl
+
+SEG_LIST = os.environ.get("NNUE_REL_SEGLIST", "0") == "1"   # seg_grad's join over the multi-piece rows only
+EVICT = os.environ.get("NNUE_EVICT", "0") == "1"   # L2 hints in _rel_fwd and _seg_piece: the same values
+JNP = 1024   # _seg_join_list's programs a lane block (2,048 to 32,768 timed no faster on a t91 batch)
 
 BB = 32    # bags a program
 BT = 128   # lanes a program
@@ -43,7 +49,8 @@ BTB = 64   # lanes a program (seg backward)
 
 
 @triton.jit
-def _rel_fwd(table, cols, off, cnt, out, nbags, T: tl.constexpr, BB: tl.constexpr, BT: tl.constexpr):
+def _rel_fwd(table, cols, off, cnt, out, nbags, T: tl.constexpr, BB: tl.constexpr, BT: tl.constexpr,
+             EVR: tl.constexpr = "", EVS: tl.constexpr = ""):
     pb = tl.program_id(0)
     pt = tl.program_id(1)
     b = (pb * BB + tl.arange(0, BB)).to(tl.int64)
@@ -56,9 +63,10 @@ def _rel_fwd(table, cols, off, cnt, out, nbags, T: tl.constexpr, BB: tl.constexp
     for k in range(0, tl.max(c, axis=0)):   # the block's longest bag; shorter bags are masked off
         km = bm & (k < c)
         col = tl.load(cols + o + k, mask=km, other=0).to(tl.int64)
-        v = tl.load(table + col[:, None] * T + lanes[None, :], mask=km[:, None] & lm[None, :], other=0.0)
+        v = tl.load(table + col[:, None] * T + lanes[None, :], mask=km[:, None] & lm[None, :], other=0.0,
+                    eviction_policy=EVR)
         acc += v.to(tl.float32)
-    tl.store(out + b[:, None] * T + lanes[None, :], acc, mask=bm[:, None] & lm[None, :])
+    tl.store(out + b[:, None] * T + lanes[None, :], acc, mask=bm[:, None] & lm[None, :], eviction_policy=EVS)
 
 
 @triton.jit
@@ -128,7 +136,8 @@ class RelSumEB(torch.autograd.Function):
 
 @triton.jit
 def _seg_piece(g, sbag, rstart, rcnt, npiece, poff, prow, ptot, dw, part,
-               T: tl.constexpr, CS: tl.constexpr, BT: tl.constexpr):
+               T: tl.constexpr, CS: tl.constexpr, BT: tl.constexpr, EVR: tl.constexpr = "",
+               EVS: tl.constexpr = ""):
     # program (p, pt): piece p's at most CS sorted entries, lanes pt*BT .. pt*BT + BT - 1
     p = tl.program_id(0)
     pt = tl.program_id(1)
@@ -142,11 +151,11 @@ def _seg_piece(g, sbag, rstart, rcnt, npiece, poff, prow, ptot, dw, part,
     b = tl.load(sbag + s + i, mask=im, other=0).to(tl.int64)
     lanes = pt * BT + tl.arange(0, BT)
     lm = lanes < T
-    v = tl.load(g + b[:, None] * T + lanes[None, :], mask=im[:, None] & lm[None, :], other=0.0)
+    v = tl.load(g + b[:, None] * T + lanes[None, :], mask=im[:, None] & lm[None, :], other=0.0, eviction_policy=EVR)
     acc = tl.sum(v.to(tl.float32), axis=0)
     one = tl.load(npiece + row) == 1
-    tl.store(dw + row * T + lanes, acc, mask=lm & ok & one)
-    tl.store(part + p.to(tl.int64) * T + lanes, acc, mask=lm & ok & (one == 0))
+    tl.store(dw + row * T + lanes, acc, mask=lm & ok & one, eviction_policy=EVS)
+    tl.store(part + p.to(tl.int64) * T + lanes, acc, mask=lm & ok & (one == 0), eviction_policy=EVS)
 
 
 @triton.jit
@@ -158,6 +167,24 @@ def _seg_join(part, npiece, poff, dw, T: tl.constexpr, BT: tl.constexpr):
     lanes = pt * BT + tl.arange(0, BT)
     lm = lanes < T
     if m > 1:
+        p0 = tl.load(poff + row).to(tl.int64)
+        acc = tl.zeros((BT,), dtype=tl.float32)
+        for j in range(0, m):
+            acc += tl.load(part + (p0 + j) * T + lanes, mask=lm, other=0.0)
+        tl.store(dw + row * T + lanes, acc, mask=lm)
+
+
+@triton.jit
+def _seg_join_list(part, npiece, poff, dw, mrows, nm, T: tl.constexpr, BT: tl.constexpr, NP: tl.constexpr):
+    # program (q, pt): the rows mrows[q], mrows[q + NP], ... below nm[0] (the rows of two or more pieces, in row
+    # order), each adding its partials up in piece order from 0.0, as _seg_join does
+    q = tl.program_id(0)
+    pt = tl.program_id(1)
+    lanes = pt * BT + tl.arange(0, BT)
+    lm = lanes < T
+    for i in range(q, tl.load(nm), NP):
+        row = tl.load(mrows + i).to(tl.int64)
+        m = tl.load(npiece + row)
         p0 = tl.load(poff + row).to(tl.int64)
         acc = tl.zeros((BT,), dtype=tl.float32)
         for j in range(0, m):
@@ -191,8 +218,15 @@ def seg_grad(g, cols, cnt, nbags, nrows):
     part = torch.empty((pmax, T), dtype=torch.float32, device=dev)
     gg = g.contiguous() if g.dtype == torch.bfloat16 else g.float().contiguous()   # bf16: rel_sum_rows(g16=True)
     _seg_piece[(pmax, triton.cdiv(T, BTB))](gg, sbag, rstart, rcnt, npiece, poff, prow.contiguous(), ptot, dw, part,
-                                            T=T, CS=CS, BT=BTB)
-    _seg_join[(nrows, triton.cdiv(T, BTB))](part, npiece, poff, dw, T=T, BT=BTB)
+                                            T=T, CS=CS, BT=BTB, EVR="evict_last" if EVICT else "",
+                                            EVS="evict_first" if EVICT else "")
+    if SEG_LIST:   # the same sums over the rows that have partials only, found without a host sync
+        multi = npiece > 1
+        mrows = torch.argsort((~multi).to(torch.uint8), stable=True).to(torch.int32)   # those rows first, in order
+        nm = multi.sum(dtype=torch.int32).view(1)
+        _seg_join_list[(JNP, triton.cdiv(T, BTB))](part, npiece, poff, dw, mrows, nm, T=T, BT=BTB, NP=JNP)
+    else:
+        _seg_join[(nrows, triton.cdiv(T, BTB))](part, npiece, poff, dw, T=T, BT=BTB)
     return dw
 
 
@@ -256,7 +290,9 @@ class RelSumRows(torch.autograd.Function):
         T, S = w.shape[1], rows.shape[1]
         off = torch.arange(nbags, device=w.device, dtype=torch.int64) * S
         out = torch.empty((nbags, T), dtype=torch.float32, device=w.device)
-        _rel_fwd[(triton.cdiv(nbags, BB), triton.cdiv(T, BT))](table, rows, off, cnt, out, nbags, T=T, BB=BB, BT=BT)
+        _rel_fwd[(triton.cdiv(nbags, BB), triton.cdiv(T, BT))](table, rows, off, cnt, out, nbags, T=T, BB=BB, BT=BT,
+                                                               EVR="evict_last" if EVICT else "",
+                                                               EVS="evict_first" if EVICT else "")
         nnz = torch.empty(1, dtype=torch.int64, pin_memory=True)
         nnz.copy_(cnt.sum(dtype=torch.int64).view(1), non_blocking=True)
         ev = torch.cuda.Event()
@@ -285,7 +321,7 @@ def rel_sum_rows(w, rows, cnt, nbags, bf16=False, g16=False):
         raise ValueError(f"rel_sum_rows: the table must be a 2-D fp32 tensor, not {w.dtype} {tuple(w.shape)}")
     if rows.dtype != torch.int32 or rows.shape[0] != nbags or cnt.shape[0] != nbags:
         raise ValueError(f"rel_sum_rows: rows {rows.dtype} {tuple(rows.shape)} and {cnt.shape[0]} counts for {nbags} bags")
-    table = w.detach().to(torch.bfloat16).contiguous() if bf16 else w.detach().contiguous()
+    table = bf16_copy(w) if bf16 else w.detach().contiguous()   # bf16_copy: adamw16's copy, else the cast
     return RelSumRows.apply(w, table, rows, cnt, nbags, g16)
 
 
@@ -337,3 +373,88 @@ def rel_adamw(w, g, state, coef, lr, betas, eps, lo, hi, BLOCK=2048):
     _rel_adamw[(triton.cdiv(n, BLOCK),)](w, g, state["exp_avg"], state["exp_avg_sq"], state["max_exp_avg_sq"],
                                          coef, bc, n, float(lr), float(betas[0]), float(betas[1]), float(eps),
                                          float(lo), float(hi), BLOCK=BLOCK)
+
+
+# ---- NNUE_REL_OPT=fused16: the two tables' AdamW step in one pass each, with their bf16 forward copies ------------
+# rel_adamw's step for any table (the feature layer's or the relation rows'), plus, in the same pass, the bf16 copy
+# of its first n16 values that the next forward reads in place of a cast (bf16_copy). The cast it replaces,
+# w.to(torch.bfloat16), rounds to nearest even as this kernel's .to(tl.bfloat16) does (cvt.rn.bf16.f32), so the
+# copy is the cast's bit for bit; the kernel writes it from the value it stores, after the clamp.
+@triton.jit
+def _adamw16(p_ptr, g_ptr, m_ptr, v_ptr, vm_ptr, o_ptr, coef_ptr, bc_ptr, n, n16, lr, beta1, beta2, eps, lo, hi,
+             CLAMP: tl.constexpr, OUT16: tl.constexpr, BLOCK: tl.constexpr):
+    off = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)   # n < 2^31
+    mask = off < n
+    p = tl.load(p_ptr + off, mask=mask, other=0.0)
+    g = tl.load(g_ptr + off, mask=mask, other=0.0) * tl.load(coef_ptr)
+    m = tl.load(m_ptr + off, mask=mask, other=0.0)
+    v = tl.load(v_ptr + off, mask=mask, other=0.0)
+    vm = tl.load(vm_ptr + off, mask=mask, other=0.0)
+    bc1 = tl.load(bc_ptr)
+    bc2s = tl.load(bc_ptr + 1)
+    m = tl.fma(beta1, m, tl.fma(-beta1, g, g))
+    gg = g * g
+    v = tl.fma(beta2, v, tl.fma(-beta2, gg, gg))
+    step_size = tl.div_rn(lr, bc1)
+    vm = tl.maximum(vm, v)
+    denom = tl.div_rn(tl.sqrt_rn(vm), bc2s) + eps
+    p = p - tl.div_rn(step_size * m, denom)
+    if CLAMP:
+        p = tl.minimum(tl.maximum(p, lo), hi)
+    tl.store(p_ptr + off, p, mask=mask)
+    tl.store(m_ptr + off, m, mask=mask)
+    tl.store(v_ptr + off, v, mask=mask)
+    tl.store(vm_ptr + off, vm, mask=mask)
+    if OUT16:
+        tl.store(o_ptr + off, p.to(tl.bfloat16), mask=off < n16)
+
+
+BF16 = {}   # id(table) -> (its bf16 copy of the first rows, the table's _version when the copy was written)
+_BETAS = {}  # (device, beta1, beta2) -> both as fp32 tensors on the device, made once: a tensor made from a Python
+             # float on a CUDA device is copied from pageable host memory, which waits for the GPU (a host sync)
+
+
+def bf16_copy(w, rows=None):
+    """w[:rows] (all of w without rows) in bf16 for a forward: the copy adamw16 wrote with the table's last step, if
+    nothing has written the table since (a torch in-place op bumps its _version; adamw16's kernel does not), else
+    the cast w[:rows].to(torch.bfloat16) of before. Both are the same bits."""
+    e = BF16.get(id(w))
+    nr = w.shape[0] if rows is None else rows
+    if e is not None and e[1] == w._version and e[0].shape[0] == nr:
+        return e[0]
+    return w.detach()[:nr].to(torch.bfloat16).contiguous()
+
+
+def adamw16(w, g, state, coef, lr, betas, eps, clamp=None, rows16=None, BLOCK=512, num_warps=4):
+    """rel_adamw for any fp32 table w (amsgrad, no weight decay): g * coef, the update, clamp_(*clamp) when given,
+    and with rows16 the bf16 copy of w[:rows16] for the next forward (bf16_copy finds it). state is the optimizer's
+    state for w, created here as torch's AdamW creates it; its step advances here, as torch advances it."""
+    if not state:
+        state["step"] = torch.zeros((), dtype=torch.float32, device=w.device)
+        state["exp_avg"] = torch.zeros_like(w, memory_format=torch.preserve_format)
+        state["exp_avg_sq"] = torch.zeros_like(w, memory_format=torch.preserve_format)
+        state["max_exp_avg_sq"] = torch.zeros_like(w, memory_format=torch.preserve_format)
+    if not (w.is_contiguous() and g.is_contiguous() and g.shape == w.shape and w.dtype == g.dtype == torch.float32
+            and all(state[k].is_contiguous() for k in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq"))):
+        raise ValueError("adamw16: contiguous fp32 table, gradient and state")
+    step = state["step"]
+    step.add_(1)
+    key = (str(w.device), float(betas[0]), float(betas[1]))
+    if key not in _BETAS:
+        _BETAS[key] = tuple(torch.tensor(b, dtype=torch.float32, device=w.device) for b in key[1:])
+    b1, b2 = _BETAS[key]
+    bc = torch.stack((1 - torch.pow(b1, step), torch.sqrt(1 - torch.pow(b2, step)))).contiguous()
+    n = w.numel()
+    out = None
+    if rows16 is not None:
+        e = BF16.get(id(w))
+        out = e[0] if e is not None and e[0].shape == (rows16,) + tuple(w.shape[1:]) else \
+            torch.empty((rows16,) + tuple(w.shape[1:]), dtype=torch.bfloat16, device=w.device)
+    lo, hi = clamp if clamp is not None else (0.0, 0.0)
+    _adamw16[(triton.cdiv(n, BLOCK),)](w, g, state["exp_avg"], state["exp_avg_sq"], state["max_exp_avg_sq"],
+                                       out if out is not None else w, coef, bc, n,
+                                       out.numel() if out is not None else 0, float(lr), float(betas[0]),
+                                       float(betas[1]), float(eps), float(lo), float(hi), CLAMP=clamp is not None,
+                                       OUT16=out is not None, BLOCK=BLOCK, num_warps=num_warps)
+    if out is not None:
+        BF16[id(w)] = (out, w._version)

@@ -13,6 +13,8 @@ formats those specifications define. `src/...` in comments here means the engine
 | :--- | :--- |
 | `trainer/resident_train.py` | The trainer, for one CUDA GPU: float training and quantization-aware training (QAT) on the engine's grid |
 | `trainer/luminex_nnue_train.py` | The network's model and the training helpers the trainer imports |
+| `trainer/resident_train_dh_rel.py` | The V5 trainer (relation lanes, the draw head): the float phase of the runs since G6, with the exact speed-ups of DEVLOG section 25 |
+| `trainer/rel_gate.py`, `trainer/rel_kernels.py`, `trainer/rel_rows.py` | V5's relation inputs: the rows straight from the records, their sums and gradient, the tables' fused optimizer pass |
 | `trainer/ft_fused.py` | Fused Triton kernels for the feature layer (`NNUE_FT_DENSE=3`) |
 | `trainer/quantize_i8.py` | A float network to the int8 network the engine loads |
 | `trainer/lnt8_from_gate.py` | A gen768t (LNT8) network from a V5 gate arm's files |

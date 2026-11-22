@@ -26,6 +26,13 @@ Environment:
   NNUE_REL_TABLE16 [0]   with triton: 1 = the forward reads a bf16 copy of the table (half the bytes; exact under
                          QAT's k / 128 rows), 0 = the fp32 table
   NNUE_REL_CHUNK [2097152]  active rows per index_add_ call (bounds the temporaries)
+  NNUE_REL_OPT [torch]   the step: torch = clip_grad_norm_, AdamW and the clamp as three calls; fused = the relation
+                         table's share in one pass (rel_kernels.rel_adamw); fused16 = the relation table's and the
+                         feature table's each in one pass that also writes the bf16 copy the next forward reads
+                         (rel_kernels.adamw16): the same values bit for bit, see step()
+  NNUE_REL_SEGLIST [0]   trirows/triseg: 1 = seg_grad's join over the rows with two or more pieces only, found
+                         without a host sync (rel_kernels._seg_join_list): the same sums
+  NNUE_REL_ROWS2 [0]     trirows: 1 = the rows by rel_rows._rel_rows2, the same rows by fewer instructions
   NNUE_REL_FUSED [1]     1: on a GPU, indices() as one compiled dense pass (the same rows in the same order);
                          0: the step-by-step version, which the CPU always runs
   NNUE_REL_JOIN [inplace]   how the sums meet the feature layer's lanes: inplace = one autograd function that adds
@@ -670,16 +677,24 @@ def clip(model):
         model.rel.clamp_(-CLIP, CLIP)
 
 
-OPT = os.environ.get("NNUE_REL_OPT", "torch")   # torch | fused: see step()
+OPT = os.environ.get("NNUE_REL_OPT", "torch")   # torch | fused | fused16: see step()
+if OPT not in ("torch", "fused", "fused16"):
+    raise SystemExit(f"FAIL: NNUE_REL_OPT={OPT}")
 
 
 @torch.no_grad()
-def step(model, opt, params, max_norm):
+def step(model, opt, params, max_norm, ft=None, ft_rows=None):
     """clip_grad_norm_(params, max_norm), opt.step() and clip(model), with the relation table's share in one pass
     (NNUE_REL_OPT=fused, rel_kernels.rel_adamw): the total norm over every gradient, the other gradients scaled by
     torch as before, the table's gradient scaled, AdamW-updated and clamped by one kernel, the other groups'
     AdamW by torch (the table's gradient set aside, so torch's step leaves it alone). The same values as the three
-    calls, bit for bit; it saves the table's separate scale, update and clamp passes."""
+    calls, bit for bit; it saves the table's separate scale, update and clamp passes.
+    NNUE_REL_OPT=fused16 (rel_kernels.adamw16): the same for the relation table and, given ft (the feature layer's
+    table), for that table too, each in one pass that also writes the bf16 copy of the table (ft: of its first
+    ft_rows rows) that the next forward reads instead of casting it (rel_kernels.bf16_copy); the other groups'
+    AdamW by torch on the gradients torch scaled. The same values bit for bit as the three calls and the casts."""
+    if OPT == "fused16" and getattr(model, "rel", None) is not None and model.rel.is_cuda:
+        return _step16(model, opt, params, max_norm, ft, ft_rows)
     w = getattr(model, "rel", None) if T and OPT == "fused" else None
     g = w.grad if w is not None else None
     if g is None or not w.is_cuda:
@@ -701,6 +716,35 @@ def step(model, opt, params, max_norm):
     w.grad = None
     opt.step()
     rel_kernels.rel_adamw(w, g, opt.state[w], coef, group["lr"], group["betas"], group["eps"], -CLIP, CLIP)
+
+
+def _step16(model, opt, params, max_norm, ft, ft_rows):
+    import rel_kernels
+    tabs = [(model.rel, (-CLIP, CLIP), None)]   # (table, clamp, rows of its bf16 copy: None = all)
+    if ft is not None and ft.grad is not None:
+        tabs.append((ft, None, ft_rows))
+    tabs = [t for t in tabs if t[0].grad is not None]
+    if max_norm > 0:   # clip_grad_norm_'s total over every gradient, in its order; its coefficient, as it computes it
+        total = torch.nn.utils.get_total_norm([p.grad for p in params if p.grad is not None], 2.0, False, None)
+        torch.nn.utils.clip_grads_with_norm_([p for p in params if all(p is not t[0] for t in tabs)], max_norm,
+                                             total, None)
+        coef = torch.clamp(float(max_norm) / (total + 1e-6), max=1.0)
+    else:
+        coef = torch.ones((), dtype=torch.float32, device=model.rel.device)
+    work = []
+    for w, clamp, rows in tabs:
+        group = next(gr for gr in opt.param_groups if any(p is w for p in gr["params"]))
+        if group["weight_decay"] != 0 or not group["amsgrad"] or group.get("maximize") or not group.get("fused"):
+            raise SystemExit("FAIL: NNUE_REL_OPT=fused16: the tables' groups must be fused amsgrad AdamW without "
+                             "weight decay")
+        work.append((w, w.grad, group, clamp, rows))
+        w.grad = None   # torch's step leaves the table alone
+    opt.step()
+    for w, g, group, clamp, rows in work:
+        rel_kernels.adamw16(w, g, opt.state[w], coef, group["lr"], group["betas"], group["eps"], clamp,
+                            w.shape[0] if rows is None else rows)
+    # the tables' gradients stay dropped, as step()'s fused path leaves the relation table's: nothing reads a
+    # gradient after the step, and zero_grad(set_to_none=True) would drop them before the next backward
 
 
 @torch.no_grad()

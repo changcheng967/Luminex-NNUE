@@ -39,6 +39,8 @@ import triton.language as tl
 # Triton's CPU interpreter (TRITON_INTERPRET=1, check_lanes_cpu.py) computes bf16 dots wrong (3.8.0: a 0/1 x bf16
 # product off by 2e10 where the answer is 3.6); under it the kernels run their dots in fp32, the same values.
 INTERP = os.environ.get("TRITON_INTERPRET", "0") == "1"
+# NNUE_EVICT=1: L2 hints in _ft_fwd (the table's tiles evict_last, the sums and h evict_first); the same values
+EVICT = os.environ.get("NNUE_EVICT", "0") == "1"
 
 PSQ = 768   # piece-square features per king bucket
 NKB = 32    # king buckets
@@ -162,11 +164,12 @@ def _lanes(lane, order, rows, rmask, cols, T: tl.constexpr):
 
 
 @triton.jit
-def _ft_fwd(planes, ranges, w, bias, wscale, out, wlo, dst, h, lane, order,
+def _ft_fwd(planes, ranges, w, bias, wscale, out, wlo, dst, h, lane, order, NB0,
             L1: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, FP8: tl.constexpr, SPLIT: tl.constexpr,
-            ACT: tl.constexpr, T: tl.constexpr, INTERP: tl.constexpr):
+            ACT: tl.constexpr, T: tl.constexpr, INTERP: tl.constexpr, EVW: tl.constexpr = "",
+            EVS: tl.constexpr = ""):
     t = tl.program_id(0)
-    nb = tl.program_id(1)
+    nb = tl.program_id(1) + NB0   # ft_fwd(nb=(NB0, count)): a run of the column blocks
     r0 = tl.load(ranges + 3 * t)
     r1 = tl.load(ranges + 3 * t + 1)
     kb = tl.load(ranges + 3 * t + 2).to(tl.int64)
@@ -187,7 +190,7 @@ def _ft_fwd(planes, ranges, w, bias, wscale, out, wlo, dst, h, lane, order,
         word = tl.where(upper[None, :], hi[:, None], lo[:, None])
         bit = ((word >> sh[None, :]) & 1).to(tl.float32)
         k = p * 64 + j
-        wt = tl.load(wrow + k[:, None] * L1 + cols[None, :])
+        wt = tl.load(wrow + k[:, None] * L1 + cols[None, :], eviction_policy=EVW)
         if FP8:
             acc = tl.dot(bit.to(tl.float8e4nv), wt, acc)
         elif INTERP:   # Triton's CPU interpreter gets bf16 dots wrong (3.8.0); the same values in fp32 there
@@ -205,7 +208,7 @@ def _ft_fwd(planes, ranges, w, bias, wscale, out, wlo, dst, h, lane, order,
             s = acc
         else:
             s = acc.to(tl.bfloat16)
-        tl.store(out + rows[:, None] * L1 + cols[None, :], s, mask=rmask[:, None])
+        tl.store(out + rows[:, None] * L1 + cols[None, :], s, mask=rmask[:, None], eviction_policy=EVS)
         x = s.to(tl.float32) + tl.load(bias + cols)[None, :]
         if T > 0:   # extra lane sums (the relation rows) on lanes 0..T-1, after the bias as forward() adds them
             if nb * BN < T:
@@ -217,7 +220,7 @@ def _ft_fwd(planes, ranges, w, bias, wscale, out, wlo, dst, h, lane, order,
         if SPLIT:
             tl.store(hp, y, mask=rmask[:, None])
         else:
-            tl.store(hp, y.to(tl.bfloat16), mask=rmask[:, None])
+            tl.store(hp, y.to(tl.bfloat16), mask=rmask[:, None], eviction_policy=EVS)
     else:
         acc = acc + tl.load(bias + cols)[None, :]
         if SPLIT:
@@ -303,7 +306,7 @@ def lane_args(lanes, R, L1):
 
 
 def ft_fwd(planes_s, ranges, w, bias, BM, BN, fp8=False, wscale=None, num_warps=8, num_stages=3, out=None,
-           w_lo=None, act=None, lanes=None):
+           w_lo=None, act=None, lanes=None, h=None, nb=None):
     """planes_s: side-rows in sorted order; ranges from plan(kb, BM). w: [32 * 768, L1]
     bf16 (or e4m3 with wscale [L1] fp32 = 1 / column scale). Returns [R, L1] bf16 in sorted order.
     With w_lo (bf16, split_bf16's second part), the table is w + w_lo and the output fp32: exact
@@ -313,7 +316,9 @@ def ft_fwd(planes_s, ranges, w, bias, BM, BN, fp8=False, wscale=None, num_warps=
     offset dst[r] (bf16; fp32 with w_lo).
     With act, lanes = (sums [R, T] fp32 in side-row order, order from plan()) adds extra sums on lanes
     0..T-1 after the bias (the relation inputs): h = clamp(sums + bias + lane sums, 0, 1)^2, the
-    returned sums still without either."""
+    returned sums still without either.
+    nb = (first, count) runs only those column blocks of BN lanes, into out and h when given (with act, both or
+    neither): two calls over complementary runs write what one call writes, each tile computed as it is in one call."""
     R, L1 = planes_s.shape[0], w.shape[1]
     split = w_lo is not None
     if split and fp8:
@@ -323,17 +328,23 @@ def ft_fwd(planes_s, ranges, w, bias, BM, BN, fp8=False, wscale=None, num_warps=
     lane, order, T = lane_args(lanes, R, L1)
     if out is None:
         out = torch.empty(R, L1, dtype=torch.float32 if split else torch.bfloat16, device=planes_s.device)
-    h = out
     if act is not None:
         dst, n = act
         if R != 2 * n or dst.shape[0] != R:
             raise ValueError(f"act: {R} side-rows, {dst.shape[0]} offsets for {n} positions")
-        h = torch.empty(n, 2 * L1, dtype=out.dtype, device=planes_s.device)
-    grid = (ranges.shape[0], L1 // BN)
+        if h is None:
+            h = torch.empty(n, 2 * L1, dtype=out.dtype, device=planes_s.device)
+    else:
+        h = out
+    nb0, nbn = (0, L1 // BN) if nb is None else nb
+    if nb0 < 0 or nbn <= 0 or nb0 + nbn > L1 // BN:
+        raise ValueError(f"nb {nb}: column blocks of {L1 // BN}")
+    grid = (ranges.shape[0], nbn)
     _ft_fwd[grid](planes_s, ranges, w, bias, wscale if fp8 else bias, out, w_lo if split else w,
                   act[0] if act is not None else ranges, h,
-                  lane if T else bias, order if T else ranges,
+                  lane if T else bias, order if T else ranges, nb0,
                   L1=L1, BM=BM, BN=BN, FP8=fp8, SPLIT=split, ACT=act is not None, T=T, INTERP=INTERP,
+                  EVW="evict_last" if EVICT else "", EVS="evict_first" if EVICT else "",
                   num_warps=num_warps, num_stages=num_stages)
     return out if act is None else (out, h)
 

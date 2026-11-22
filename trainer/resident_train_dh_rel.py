@@ -120,6 +120,13 @@ Environment (default in brackets):
                      kernel: no un-sort of the sums, no elementwise passes over them. The
                      same values and gradients bit for bit (the bias gradient sums in another
                      order); 0 = the separate elementwise pass of before
+  NNUE_REL_STREAMS [0]  with NNUE_FT_ACT and the relation rows (NNUE_REL_T): 1 = the relation rows, their sums
+                     and their backward on a CUDA stream of their own, and the table's gradient (ft_bwd) on
+                     another, so the step's two independent paths overlap; the feature layer's forward runs
+                     its lanes without relation rows while the rows are summed. The same kernels on the same
+                     values, only at other times (the float phase; QAT keeps one stream)
+  NNUE_EVICT [0]     1 = L2 hints in _ft_fwd, _rel_fwd and _seg_piece (what they re-read stays, what they
+                     write streams through); the same values
   NNUE_FT_TILE [1024]  rows per tile of the dense feature layer
   NNUE_FT_TF32 [1]   the dense gradient matmul in TF32 (0: exact fp32, slower)
   NNUE_TARGET_CLIP [1500]  |target| cap inside the loss (mates and big scores stay
@@ -1169,17 +1176,28 @@ def ft_sorted_rows(wf, bf, stm=None, L1=0):
     return planes_s, order, rf, rb, dst
 
 
-def ft_sums(planes_s, rf, weight, bias, act=None, lanes=None):
+def ft_sums(planes_s, rf, weight, bias, act=None, lanes=None, **kw):
     """ft_fused.ft_fwd on the table as the run holds it (ft_fwd's act: the activation too; lanes:
-    extra lane sums added before it)."""
+    extra lane sums added before it; kw: ft_fwd's out, h and nb, bf16 forward only)."""
+    if kw and (QAT or FT_FP8 >= 2):
+        raise ValueError("ft_sums: out, h and nb in the bf16 forward only")
     if QAT:   # exact: hi + lo is the rounded weight, the sums fp32
         hi, lo = FF.split_bf16(weight[:NUM_INPUTS].float())
         return FF.ft_fwd(planes_s, rf, hi, bias, w_lo=lo, act=act, lanes=lanes, **FUSED_FWD)
     if FT_FP8 >= 2:   # the table in e4m3, scaled per column
         w8, wsc = FF.fp8_cols(weight[:NUM_INPUTS])
         return FF.ft_fwd(planes_s, rf, w8, bias, fp8=True, wscale=wsc, act=act, lanes=lanes, **FUSED_FWD)
-    return FF.ft_fwd(planes_s, rf, weight[:NUM_INPUTS].to(torch.bfloat16), bias, act=act, lanes=lanes,
-                     **FUSED_FWD)
+    return FF.ft_fwd(planes_s, rf, ft_table16(weight), bias, act=act, lanes=lanes, **FUSED_FWD, **kw)
+
+
+def ft_table16(weight):
+    """The table's bf16 copy for the fused forward: the cast weight[:NUM_INPUTS].to(torch.bfloat16), or under
+    NNUE_REL_OPT=fused16 the same bits as the last step wrote them (rel_kernels.bf16_copy; the cast when the table
+    changed since)."""
+    if REL.OPT == "fused16" and weight.is_cuda:
+        import rel_kernels
+        return rel_kernels.bf16_copy(weight, NUM_INPUTS)
+    return weight[:NUM_INPUTS].to(torch.bfloat16)
 
 
 def ft_weight_grad(planes_s, rb, g, nrows):
@@ -1206,14 +1224,26 @@ class FusedAct(torch.autograd.Function):
     adds the relation inputs to forward()'s sums; backward returns their gradient, fp32."""
 
     @staticmethod
-    def forward(ctx, wf, bf, weight, bias, stm, lane):
+    def forward(ctx, wf, bf, weight, bias, stm, lane, ev=None, wref=None):
         ctx.set_materialize_grads(False)
         n, L1 = wf.shape[0], weight.shape[1]
         planes_s, order, rf, rb, dst = ft_sorted_rows(wf, bf, stm, L1)
-        lanes = None if lane is None else (lane, order)
-        sums, h = ft_sums(planes_s, rf, weight, bias, act=(dst, n), lanes=lanes)
+        if ev is not None:   # NNUE_REL_STREAMS: lane is being summed on its stream; first the blocks without it.
+            # weight comes detached (no autograd edge: ft_grad_join hands its gradient over); wref[0] is the
+            # parameter itself, whose bf16 copy the forward reads
+            w = wref[0]
+            nbt, nbl = lane.shape[1] // FUSED_FWD["BN"], L1 // FUSED_FWD["BN"]
+            sums, h = ft_sums(planes_s, rf, w, bias, act=(dst, n), nb=(nbt, nbl - nbt))
+            cur = torch.cuda.current_stream()
+            cur.wait_event(ev)
+            lane.record_stream(cur)
+            ft_sums(planes_s, rf, w, bias, act=(dst, n), lanes=(lane, order), out=sums, h=h, nb=(0, nbt))
+        else:
+            lanes = None if lane is None else (lane, order)
+            sums, h = ft_sums(planes_s, rf, weight, bias, act=(dst, n), lanes=lanes)
         ctx.save_for_backward(planes_s, rb, dst, sums, bias, order, lane)
         ctx.nrows = weight.shape[0]
+        ctx.w = wref[0] if ev is not None else None   # the table: its gradient on a side stream
         return h, h.detach()
 
     @staticmethod
@@ -1222,9 +1252,50 @@ class FusedAct(torch.autograd.Function):
         if gh is None:
             gh, gh2 = gh2, None
         if gh is None:
-            return None, None, None, None, None, None
+            return None, None, None, None, None, None, None, None
         gs, db, gl = FF.act_bwd(gh, gh2, sums, dst, bias, lanes=None if lane is None else (lane, order))
-        return None, None, ft_weight_grad(planes_s, rb, gs, ctx.nrows), db, None, gl
+        if ctx.w is not None:   # NNUE_REL_STREAMS: X^T G on a stream of its own while autograd runs the relation
+            # backward (gl's) on the relation stream; ft_grad_join() hands the result to the table after backward()
+            cur = torch.cuda.current_stream()
+            s = cuda_stream("ftb")
+            s.wait_stream(cur)
+            with torch.cuda.stream(s):
+                dw = ft_weight_grad(planes_s, rb, gs, ctx.nrows)
+            for t in (planes_s, rb, gs):
+                t.record_stream(s)
+            FTW_PENDING.append((ctx.w, dw, s))
+            return None, None, None, db, None, gl, None, None
+        return None, None, ft_weight_grad(planes_s, rb, gs, ctx.nrows), db, None, gl, None, None
+
+
+REL_STREAMS = env("NNUE_REL_STREAMS", "0") == "1"   # see ft_fused_act
+_STREAMS = {}
+FTW_PENDING = []   # (table, its gradient, the stream computing it): FusedAct.backward's, for ft_grad_join()
+
+
+def cuda_stream(name):
+    if name not in _STREAMS:
+        _STREAMS[name] = torch.cuda.Stream()
+    return _STREAMS[name]
+
+
+def ft_grad_join():
+    """After backward(): each feature-table gradient FusedAct.backward left on its stream, waited for on the
+    current stream and handed to the table as autograd's AccumulateGrad would: through the table's hooks (the
+    padding row's, luminex_nnue_train), then the gradient itself, or added to one already there."""
+    cur = torch.cuda.current_stream() if FTW_PENDING else None
+    while FTW_PENDING:
+        w, dw, s = FTW_PENDING.pop(0)
+        cur.wait_stream(s)
+        dw.record_stream(cur)
+        for hook in (getattr(w, "_backward_hooks", None) or {}).values():
+            r = hook(dw)
+            if r is not None:
+                dw = r
+        if w.grad is None:
+            w.grad = dw
+        else:
+            w.grad += dw
 
 
 @torch.compiler.disable
@@ -1244,6 +1315,18 @@ LANE_SUMS = REL.lane_sums if REL.T and FT_ACT else None   # V5 gate: the relatio
 
 @torch.compiler.disable
 def ft_fused_act(wf, bf, stm, weight, bias):
+    if REL_STREAMS and LANE_SUMS is not None and not QAT and wf.is_cuda:
+        # NNUE_REL_STREAMS: the relation rows and their sums on a stream of their own, beside the feature layer's
+        # sort and its forward over the lanes without them; autograd runs their backward on that stream too.
+        # The same kernels on the same values: only when they run changes.
+        cur = torch.cuda.current_stream()
+        s = cuda_stream("rel")
+        s.wait_stream(cur)
+        with torch.cuda.stream(s):
+            lane = LANE_SUMS()
+            ev = torch.cuda.Event()
+            ev.record()
+        return FusedAct.apply(wf, bf, weight.detach(), bias, stm, lane, ev, (weight,))
     lane = LANE_SUMS() if LANE_SUMS is not None else None
     if QAT:
         return FusedAct.apply(wf, bf, qat_ft(weight), qat_bias(bias), stm, lane)
@@ -1680,10 +1763,14 @@ def main():
                 loss = step_fn(model, batch)
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
-                if GRAD_CLIP > 0:
-                    torch.nn.utils.clip_grad_norm_(params, GRAD_CLIP)
-                opt.step()
-                REL.clip(model)   # rows inside the int8 range
+                ft_grad_join()   # NNUE_REL_STREAMS: the feature table's gradient from its stream
+                if REL.OPT == "fused16" and not QAT:   # the same three steps, the two tables in a pass each
+                    REL.step(model, opt, params, GRAD_CLIP, model.ft.weight, NUM_INPUTS)
+                else:
+                    if GRAD_CLIP > 0:
+                        torch.nn.utils.clip_grad_norm_(params, GRAD_CLIP)
+                    opt.step()
+                    REL.clip(model)   # rows inside the int8 range
                 sched.step()
                 gstep += 1
                 PROGRESS.update(t=time.time(), step=gstep)
