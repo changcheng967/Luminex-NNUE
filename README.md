@@ -23,6 +23,7 @@ formats those specifications define. `src/...` in comments here means the engine
 | `trainer/check_*.py` | Checks: the grid against the engine's, the fused kernels and the two feeders against their reference paths |
 | `forensics/probe_net.py` | How much of a network's capacity real positions use |
 | `bot/` | The lichess bot's start-up script and config template (the live token stays on the bot host) |
+| `runs/` | The V5 runs' code byte for byte as the GPU boxes ran it (`g7/`, `tools/`) and their cells: a record, never edited (DEVLOG section 24 maps every file by hash) |
 | `docs/DEVLOG.md` | The training log: every network generation, its runs and its measurements |
 | `docs/HCE_TUNING_RESULTS.md` | The hand-crafted evaluation's tuning record, from before the networks |
 
