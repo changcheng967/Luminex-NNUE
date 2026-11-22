@@ -1289,3 +1289,55 @@ back into LF).
 its own files. `trainer/` is the line changcheng967/Luminex#105 brought to main; the float-phase speed-ups the runs
 used (the fused relation lanes and the one-pass feature-layer inputs, open here as #2 and #3, the relation rows
 straight from the records, and the merged draw-head logits) are in `runs/g7/` and not yet in `trainer/`.
+
+## 25. The V5 trainer past 100 steps/s, every value the same (box 8, Nov 22)
+
+The user's standing goal is the fastest V5 trainer that changes nothing it learns: past 100 steps a second at
+131,072 positions a step. On molab's RTX PRO 6000 (box 8), with G8's settings, the float-phase trainer of the runs
+(`runs/g7/`, now `trainer/resident_train_dh_rel.py`) ran 97.8 steps/s on the resident files, 93.0 on two t91
+months as binpacks and 98.7 on a BT4 corpus binpack. Five settings, all off by default, take it to 107.5, 100.4
+and 107.5. Every one of them computes the same values as G7's trainer, and each was checked bit for bit before
+anything was timed.
+
+| Setting | What changes | Checked by | Measured |
+| :--- | :--- | :--- | :--- |
+| `NNUE_REL_OPT=fused16` | The step of the two big tables (24,577 x 768 and 55,960 x 256, 99% of the parameters) runs as one pass each (`rel_kernels._adamw16`). The pass does `clip_grad_norm_`'s multiply, torch 2.11's fused AdamW (amsgrad) in its fp32 operations, the relation table's clamp, and the bf16 copy that the next forward reads in place of two casts. | Every parameter, optimizer state tensor and bf16 copy compared as integers over 6 steps: from a fresh state, at six learning rates, and at step 1,000,000 | 2.17 -> 1.07 ms of optimizer a step |
+| `NNUE_REL_SEGLIST=1` | `seg_grad` joins only the rows with two or more pieces (a list), not all 55,960 x 4 | the digests | 0.27 -> 0.16 ms (t91) |
+| `NNUE_REL_ROWS2=1` | The relation rows come from the records through `rel_rows._rel_rows2`: each piece's square by a select on population counts, the hardware's popc, brev and ffs, and int32 | Counts and rows compared as integers on 12 batches (resident, tree, t91, corpus, short tails), at 8 launch settings | 0.43 -> 0.29 ms |
+| `NNUE_REL_STREAMS=1` | The relation rows, their sums and (through autograd) their backward run on a CUDA stream of their own, and `ft_bwd` on another. `ft_grad_join()` then hands the table its gradient the way `AccumulateGrad` would. | the digests | t91 97.5 -> 100.3 |
+| `NNUE_EVICT=1` | L2 eviction hints in `_ft_fwd`, `_rel_fwd` and `_seg_piece` | the digests | +0.5 with the streams, 0 without |
+
+"The digests" is prof19's check. The same random model runs in G7's trainer and in this one, on two resident and
+two t91 batches, each step twice. The loss, h, act_bwd's three outputs and every gradient but the feature table's
+are compared by SHA-256, and all are equal. The feature table's gradient comes from fp32 atomics, which vary run
+to run in G7's trainer too; here it stays within that noise.
+
+| Box 8, 1,000-step arms (G7 and the new trainer interleaved) | G7 | new |
+| :--- | :--- | :--- |
+| resident files | 97.5, 98.2 | 107.3, 107.9 |
+| t91 binpacks, a 4e8 reservoir, 8 x 4 feeder threads | 93.1, 93.1 | 100.8, 100.9 |
+| corpus binpack, the same feeder | 98.8, 98.9 | 107.6, 107.5 |
+| t91, G8's feeder (2.4e9 reservoir, 16 x 8 threads, seed 13), this commit's files | 92.8, 92.9 | 100.4, 100.3 |
+| corpus, G8's feeder | 98.6 | 107.5, 107.7 |
+
+NNUE_PROFILE, wall time a step under the profiler: resident 10.44 -> 9.67 ms; t91 10.97 -> 10.14 ms. With the
+streams, the kernels' sum (10.77 ms on t91) is above the wall time: the two paths overlap. The top items after
+(t91, ms a step): _ft_fwd 1.47, _seg_piece 1.38, _act_bwd 1.29, _ft_bwd 1.15, _adamw16 0.88, _rel_fwd 0.70, the
+tail's three GEMMs 1.14, _rel_rows2 0.29, _seg_join_list 0.16. The binpacks' host-to-device copies (0.37) run on
+the feeder's stream.
+
+Found on the way: box 5's `NNUE_REL_OPT=fused` (rel_adamw) measured 0.04 ms slower than torch because it made two
+tensors from Python floats on the GPU every step. Each is a copy from pageable memory, and that copy waits for the
+GPU. `adamw16` makes them once.
+
+Measured and dropped:
+- the relation sums inside `_ft_fwd` (prof19's NNUE_REL_INFT): exact, but 98.1 -> 81.7, because the gather
+  serialises the matmul's programs;
+- every other tile setting of `_ft_fwd`, `_act_bwd` and `_ft_bwd`: all slower. A smaller FUSED_CH gains 0.08 ms,
+  but it changes the gradient's rounding;
+- `_adamw16`'s launch settings and the join's program count: no difference;
+- the feeder's reservoir gather on its own stream: exact, but 100.4 with it and without it.
+
+trainer/ now holds what runs/g7 ran, plus these settings. A run turns them on in its cell and pins the files by
+SHA-256: resident_train_dh_rel.py 408fc5ae, ft_fused.py 4f1680c6, rel_gate.py 02c52adc, rel_kernels.py 8fd55ee8,
+rel_rows.py 9f878c07. The checks, cells and logs are in the session notes, `speed2/`.
