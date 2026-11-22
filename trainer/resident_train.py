@@ -1211,7 +1211,7 @@ class FusedAct(torch.autograd.Function):
             gh, gh2 = gh2, None
         if gh is None:
             return None, None, None, None, None
-        gs, db = FF.act_bwd(gh, gh2, sums, dst, bias)
+        gs, db, _ = FF.act_bwd(gh, gh2, sums, dst, bias)   # ft_fused.act_bwd's third value: the lanes' gradient (none here)
         return None, None, ft_weight_grad(planes_s, rb, gs, ctx.nrows), db, None
 
 
