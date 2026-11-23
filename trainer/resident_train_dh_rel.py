@@ -127,6 +127,10 @@ Environment (default in brackets):
                      values, only at other times (the float phase; QAT keeps one stream)
   NNUE_EVICT [0]     1 = L2 hints in _ft_fwd, _rel_fwd and _seg_piece (what they re-read stays, what they
                      write streams through); the same values
+  NNUE_EVAL_FUSED [0]  1 = the HEALTH gate's forward over the held-out positions through the fused kernels the
+                     training step uses, not the dense path: 3.3x faster (box 10: 3.29 -> 1.00 s on 24.5M
+                     positions), the same HEALTH numbers to all their printed digits; DISJOINT and TREE keep the
+                     dense path. The gates also print how long each part takes ([gate time])
   NNUE_FT_TILE [1024]  rows per tile of the dense feature layer
   NNUE_FT_TF32 [1]   the dense gradient matmul in TF32 (0: exact fp32, slower)
   NNUE_TARGET_CLIP [1500]  |target| cap inside the loss (mates and big scores stay
@@ -1244,6 +1248,7 @@ class FusedAct(torch.autograd.Function):
         ctx.save_for_backward(planes_s, rb, dst, sums, bias, order, lane)
         ctx.nrows = weight.shape[0]
         ctx.w = wref[0] if ev is not None else None   # the table: its gradient on a side stream
+        ctx.gs16 = REL.GS16_PENDING.pop() if lane is not None and REL.GS16_PENDING else None
         return h, h.detach()
 
     @staticmethod
@@ -1253,7 +1258,24 @@ class FusedAct(torch.autograd.Function):
             gh, gh2 = gh2, None
         if gh is None:
             return None, None, None, None, None, None, None, None
-        gs, db, gl = FF.act_bwd(gh, gh2, sums, dst, bias, lanes=None if lane is None else (lane, order))
+        gs16 = ctx.gs16
+        gs, db, gl = FF.act_bwd(gh, gh2, sums, dst, bias, lanes=None if lane is None else (lane, order),
+                                gl_out=gs16 is None)
+        if gs16 is not None:   # NNUE_REL_GS16: the relation table's gradient from gs's bf16 lanes, beside ft_bwd
+            import rel_kernels
+            model_r, rows_r, cnt_r, nnz_r, ev_r = gs16
+            cur = torch.cuda.current_stream()
+            sr = cuda_stream("rel") if REL_STREAMS else cur
+            sr.wait_stream(cur)
+            with torch.cuda.stream(sr):
+                inv = torch.empty_like(order)
+                inv[order] = torch.arange(order.shape[0], device=order.device, dtype=order.dtype)
+                dwr = rel_kernels.rows_grad16(gs, inv.to(torch.int32), rows_r, cnt_r, nnz_r, ev_r, model_r.rel.shape[0],
+                                              lane.shape[1])
+            if sr is not cur:
+                for t in (gs, order, rows_r, cnt_r):
+                    t.record_stream(sr)
+            FTW_PENDING.append((model_r.rel, dwr, sr))
         if ctx.w is not None:   # NNUE_REL_STREAMS: X^T G on a stream of its own while autograd runs the relation
             # backward (gl's) on the relation stream; ft_grad_join() hands the result to the table after backward()
             cur = torch.cuda.current_stream()
@@ -1499,15 +1521,19 @@ def material_probe(model):
 # ---------------------------------------------------------------------------
 # Validation: the numbers that name our measured weaknesses
 # ---------------------------------------------------------------------------
+EVAL_FUSED = env("NNUE_EVAL_FUSED", "0") == "1"   # see evaluate
+
+
 @torch.no_grad()
 def evaluate(model, val, gstep):
     if len(val) == 0:
         return
     P, T, FL = [], [], []
+    fused = EVAL_FUSED and FT_ACT and not QAT and str(dev).startswith("cuda")   # the training step's kernels
     for i in range(0, len(val), BS):
         wf, bf, stm, tgt, flag, cnt = expand(val[i:i + BS])
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            P.append(forward(model, wf, bf, stm, cnt).float())
+            P.append(forward(model, wf, bf, stm, cnt, ft_fused(wf, bf, model.ft.weight) if fused else None).float())
         T.append(tgt.clamp(-TARGET_CLIP, TARGET_CLIP))
         FL.append(flag)
     p, t, fl = torch.cat(P), torch.cat(T), torch.cat(FL)
@@ -1806,13 +1832,23 @@ def main():
                               f"({sess / max(el, 1.0):.2f} steps/s)", flush=True)
                         state["t_live"] = new
                 if sess % phase["eval"] == 0:
+                    _tg = time.time()
                     evaluate(model, val, gstep)
+                    _t1 = time.time()
                     evaluate_disjoint(model, dval, gstep)
+                    _t2 = time.time()
                     evaluate_disjoint(model, tval, gstep, "TREE")
+                    _t3 = time.time()
+                    print(f"  [gate time] HEALTH {_t1 - _tg:.2f} s, DISJOINT {_t2 - _t1:.2f} s, TREE {_t3 - _t2:.2f} s",
+                          flush=True)
                 if sess % phase["save"] == 0:
+                    _ts = time.time()
                     save("checkpoint")
+                    print(f"  [gate time] save {time.time() - _ts:.2f} s", flush=True)
                 if phase["keep"] > 0 and gstep % phase["keep"] == 0:
+                    _tk = time.time()
                     keep()
+                    print(f"  [gate time] keep {time.time() - _tk:.2f} s", flush=True)
                 if off + sess >= state["t_live"]:
                     done = "tmax"
                     break

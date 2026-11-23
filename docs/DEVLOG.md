@@ -1341,3 +1341,133 @@ Measured and dropped:
 trainer/ now holds what runs/g7 ran, plus these settings. A run turns them on in its cell and pins the files by
 SHA-256: resident_train_dh_rel.py 408fc5ae, ft_fused.py 4f1680c6, rel_gate.py 02c52adc, rel_kernels.py 8fd55ee8,
 rel_rows.py 9f878c07. The checks, cells and logs are in the session notes, `speed2/`.
+
+## 26. G9's run path measured, and two more settings (box 10, Nov 22-23)
+
+Box 9 was gone before its profile could run (HTTP 410 "sandbox terminated", 45 minutes before its 10-hour limit).
+Box 10 rebuilt G9's run path:
+- Leela data only: four t91 BT4 months, leela96 split_2 and test80-2023 Apr, 41.1 GB, downloaded in 150 s;
+- G9's feeder: a 2.4e9 reservoir, 16 x 8 threads, seed 17.
+
+G9's own log already said where its float phase's 7.29 hours went: a flat 105.3 steps/s of training, and 2.5% (11
+minutes) in its 54 gate-and-save pauses.
+
+**On box 10, G7 -> #6 runs 96.0, 96.1 -> 104.2, 104.3 steps/s**; G9 ran 105.3 on its whole mix. The mix holds 18.7
+relation rows a perspective, as t91 does. The profile (wall 9.81 ms a step), in ms a step:
+
+| Item | ms |
+| :--- | :--- |
+| `_ft_fwd` | 1.47 |
+| `_act_bwd` | 1.29 |
+| `_seg_piece` | 1.17 |
+| `_ft_bwd` | 1.15 |
+| `_adamw16` | 0.87 |
+| `_rel_fwd` | 0.63 |
+| the tail's GEMMs | 1.22 |
+| `_rel_rows2` | 0.28 |
+
+**A gate's pause is its HEALTH evaluation, not the save.** The gates now print `[gate time]`:
+
+| Part | Time |
+| :--- | :--- |
+| HEALTH | 3.26 s |
+| DISJOINT | 0.05 s |
+| TREE | 0.08 s |
+| save | 0.81 s |
+| keep | 0.22 s |
+
+HEALTH runs every held-out binpack position (24.5M here, 77M in G9) through the dense feature-layer path at 7.6M
+positions a second, so it took about 10 s of each of G9's pauses. A background checkpoint write was tried and
+dropped: the save is 0.8 s, and its file was not the synchronous save's bytes.
+
+Two settings, both off by default:
+
+| Setting | What changes | Checked by | Measured |
+| :--- | :--- | :--- | :--- |
+| `NNUE_EVAL_FUSED=1` | HEALTH's forward goes through the fused kernels the training step uses. Training is untouched, and DISJOINT and TREE keep the dense path. | On gen768t_04 and the 24.5M held-out positions, the HEALTH line and the 9-digit GATE loss are the same both ways (0 relative difference) | 3.29 -> 1.00 s a gate (G9's 77M: about 10 -> 3 s) |
+| `NNUE_REL_GS16=1` | The relation table's gradient is taken from act_bwd's bf16 gs, through the bucket sort's inverse, not from a separate fp32 lane gradient. gs's lanes 0..255 are bf16 of that gradient already, and the feature table's gradient reads them. No fp32 gl is written, and `_seg_piece` reads half the bytes. NOT bit for bit. | See the loss-equality runs below | 104.3 -> 107.4 steps/s |
+
+How GS16 was checked:
+- **Against the exact path:** the loss and every gradient but the two tables' are bit for bit the same; the feature
+  table's is within the atomics' noise; the relation table's is within bf16 rounding (median relative error 1.3e-3).
+- **Loss equality:** 20,000 steps from gen768t_04 (G9's start) on the mix, a cosine of 20,000, the three validation
+  lines every 2,000. Two exact arms and two GS16 arms. GS16's mean shift against the exact arms:
+
+  | Line | GS16's mean shift | The exact arms' spread (mean) |
+  | :--- | :--- | :--- |
+  | HEALTH | +2.1e-8 | 9.8e-8 |
+  | DISJOINT | +6.7e-8 (-2.5e-9 at the end, 0.000907) | 2.8e-7 |
+  | TREE | -2.2e-6 (-1.3e-6 at the end, 0.006076) | 5.2e-6 |
+
+  It moves the lines no more than the atomics move the exact arms.
+
+**The trainer of this commit on box 10** (main's trainer plus these two settings, as the files ship):
+- With both settings off, prof19's digests equal G7's (`CHECK_INFT_EQUAL`), so its default paths are #6's.
+- `CHECK_GS16_OK`, and `CHECK_EVAL_CLOSE` (3.28 -> 1.00 s).
+- With every setting on, G9's mix runs 104.3, 104.3 -> 107.3, 107.4 steps/s.
+- A gate's pause drops from 4.2 s to 2.1 s (HEALTH 0.94 s).
+- The profile's wall is 9.57 ms: `_act_bwd` 1.29 -> 1.09, `_seg_piece` 1.17 -> 1.07.
+
+For a G9-like run this is about 108 steps/s of training and pauses about 7 s shorter each (on 77M held-out
+positions), roughly 102.7 -> 107 steps/s over a float phase. The cells, checks and logs are in the session notes,
+`speed3/`.
+
+## 27. The relation lane sums in bf16 (box 10, Nov 23)
+
+g17's trace (#7's trainer) shows the GPU saturated:
+
+| Stream | Busy, ms a step |
+| :--- | :--- |
+| main | 5.8 |
+| relation | 2.7 |
+| `ft_bwd` | 1.2 |
+
+The device is idle 0.21 ms of a 9.52 ms step, and the streams overlap only about 0.6 ms. Only less total GPU work
+makes a step shorter now.
+
+**`NNUE_REL_LANE16=1`** (with GS16) stores the relation rows' lane sums in bf16: each bag's fp32 sum, rounded once,
+as the feature layer's own sums already are. That halves 3 x 268 MB a step: `_rel_fwd`'s write, and the reads by
+`_ft_fwd`'s lane tiles and by `_act_bwd`. It is NOT bit for bit: x's lanes 0..255 see the rounded sum. On a real t91
+batch from gen768t_04 the loss moves 8.6e-5 relative.
+
+The loss-equality runs: two 20,000-step arms from gen768t_04 with LANE16, read against section 26's two exact arms
+(the same seed, data and cosine). LANE16's mean shift against the exact arms stays within their own spread on every
+line:
+
+| Line | LANE16's mean shift | The exact arms' spread (mean) |
+| :--- | :--- | :--- |
+| HEALTH | -7e-9 | 9.8e-8 |
+| DISJOINT | +1.5e-8 (-1.3e-7 at the end) | 2.8e-7 |
+| TREE | -1.1e-6 | 5.2e-6 |
+
+Against the GS16 arms the shifts are -2.8e-8, -5.1e-8 and +1.0e-6.
+
+**Speed on G9's mix, 1,000-step arms:** #7's flags 107.2, 107.4 -> + LANE16 111.3, 111.3 steps/s. The 20,000-step arms
+ran 112.3 and 112.4, against 107.3 for GS16 alone and 103.8 exact. With both new settings off, the files' digests
+equal G7's.
+
+**The longer test (box 10, cell 8):** GS16 and LANE16 together against #6's exact flags, three times the horizon:
+60,000 steps from gen768t_04, a cosine of 60,000, the lines every 5,000, two exact and two candidate arms,
+interleaved. The candidate's mean shift against the exact arms:
+
+| Line | Candidate's mean shift | The exact arms' spread (mean) | End values, exact / candidate |
+| :--- | :--- | :--- | :--- |
+| HEALTH | +5.4e-8 (+1.0e-8 at the end) | 6.8e-8 | 0.001336 / 0.001336 |
+| DISJOINT | +3.4e-9 (-1.3e-7 at the end) | 2.4e-7 | 0.000904 / 0.000904 |
+| TREE | +4.7e-7 (-6.6e-7 at the end) | 4.3e-6 | 0.006069, 0.006068 / 0.006067, 0.006068 |
+
+Over the 60,000 steps the candidate ran 113.5 and 113.4 steps/s, the exact arms 106.0 and 106.0.
+
+**Measured and not adopted** (each exact, each checked in compiled mode against #7's trainer; `check_compiled.py`
+tolerates `dhead_p`'s gradient, which the compiled graph scatters with atomic adds, so it differs between two runs of
+the same trainer):
+- **The tail's dX GEMM (dL/dh = dzz @ Wcat) inside act_bwd.** A Triton dot equals cuBLAS's bf16 GEMM bit for bit
+  only when it takes the K residue first (136 = 8 + 8 x 16), the order CUTLASS's mainloop uses; the plain order
+  differs in 163 of 201M elements. Exact in the compiled path, but only 111.3 -> 112.0 steps/s: each sorted tile mixes
+  both halves of h, so it needs two dots, and they cost almost what the 403 MB write and read saved.
+- **One composed gs-row index for `_seg_piece`** instead of two dependent gathers: 111.3 -> 111.1.
+- **AMSGrad's maximum stored only where it moved:** 0.996 -> 0.969 ms of optimizer on a late-run state, 0.3% of a
+  step.
+
+What is left is tensor-core work: `_ft_fwd` 1.41 and `_ft_bwd` 1.15 ms a step, at about 45-55% of the bf16 peak.
+Triton's tile sweeps found nothing (wide tiles spill), so the next step is a hand-written feature-layer kernel.

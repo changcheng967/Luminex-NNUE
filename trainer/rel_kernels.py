@@ -40,6 +40,7 @@ import triton.language as tl
 
 SEG_LIST = os.environ.get("NNUE_REL_SEGLIST", "0") == "1"   # seg_grad's join over the multi-piece rows only
 EVICT = os.environ.get("NNUE_EVICT", "0") == "1"   # L2 hints in _rel_fwd and _seg_piece: the same values
+LANE16 = os.environ.get("NNUE_REL_LANE16", "0") == "1"   # rel_sum_rows_nograd's sums in bf16 (with NNUE_REL_GS16)
 JNP = 1024   # _seg_join_list's programs a lane block (2,048 to 32,768 timed no faster on a t91 batch)
 
 BB = 32    # bags a program
@@ -66,7 +67,8 @@ def _rel_fwd(table, cols, off, cnt, out, nbags, T: tl.constexpr, BB: tl.constexp
         v = tl.load(table + col[:, None] * T + lanes[None, :], mask=km[:, None] & lm[None, :], other=0.0,
                     eviction_policy=EVR)
         acc += v.to(tl.float32)
-    tl.store(out + b[:, None] * T + lanes[None, :], acc, mask=bm[:, None] & lm[None, :], eviction_policy=EVS)
+    tl.store(out + b[:, None] * T + lanes[None, :], acc.to(out.dtype.element_ty), mask=bm[:, None] & lm[None, :],
+             eviction_policy=EVS)
 
 
 @triton.jit
@@ -137,7 +139,7 @@ class RelSumEB(torch.autograd.Function):
 @triton.jit
 def _seg_piece(g, sbag, rstart, rcnt, npiece, poff, prow, ptot, dw, part,
                T: tl.constexpr, CS: tl.constexpr, BT: tl.constexpr, EVR: tl.constexpr = "",
-               EVS: tl.constexpr = ""):
+               EVS: tl.constexpr = "", inv=None, GSTRIDE: tl.constexpr = 0):
     # program (p, pt): piece p's at most CS sorted entries, lanes pt*BT .. pt*BT + BT - 1
     p = tl.program_id(0)
     pt = tl.program_id(1)
@@ -151,7 +153,13 @@ def _seg_piece(g, sbag, rstart, rcnt, npiece, poff, prow, ptot, dw, part,
     b = tl.load(sbag + s + i, mask=im, other=0).to(tl.int64)
     lanes = pt * BT + tl.arange(0, BT)
     lm = lanes < T
-    v = tl.load(g + b[:, None] * T + lanes[None, :], mask=im[:, None] & lm[None, :], other=0.0, eviction_policy=EVR)
+    if GSTRIDE > 0:   # seg_grad16: bag b's gradient is row inv[b] of gs (bf16, GSTRIDE lanes a row), lanes 0..T-1
+        r = tl.load(inv + b, mask=im, other=0).to(tl.int64)
+        v = tl.load(g + r[:, None] * GSTRIDE + lanes[None, :], mask=im[:, None] & lm[None, :], other=0.0,
+                    eviction_policy=EVR)
+    else:
+        v = tl.load(g + b[:, None] * T + lanes[None, :], mask=im[:, None] & lm[None, :], other=0.0,
+                    eviction_policy=EVR)
     acc = tl.sum(v.to(tl.float32), axis=0)
     one = tl.load(npiece + row) == 1
     tl.store(dw + row * T + lanes, acc, mask=lm & ok & one, eviction_policy=EVS)
@@ -192,10 +200,10 @@ def _seg_join_list(part, npiece, poff, dw, mrows, nm, T: tl.constexpr, BT: tl.co
         tl.store(dw + row * T + lanes, acc, mask=lm)
 
 
-def seg_grad(g, cols, cnt, nbags, nrows):
+def seg_grad(g, cols, cnt, nbags, nrows, inv=None, T=None):
     """The table's gradient [nrows, T] fp32 from the sums' gradient g [nbags, T]: what embedding_bag's backward
     computes, in a fixed order of its own (see the module's text). No host synchronisation."""
-    T = g.shape[1]
+    T = g.shape[1] if T is None else T   # inv given (seg_grad16): g is gs [nbags, L1] bf16 in sorted order
     nnz = cols.shape[0]
     dev = g.device
     if nrows <= 65536:   # rows - 32768 fit int16 in the same order: a stable sort gives the same permutation
@@ -219,7 +227,9 @@ def seg_grad(g, cols, cnt, nbags, nrows):
     gg = g.contiguous() if g.dtype == torch.bfloat16 else g.float().contiguous()   # bf16: rel_sum_rows(g16=True)
     _seg_piece[(pmax, triton.cdiv(T, BTB))](gg, sbag, rstart, rcnt, npiece, poff, prow.contiguous(), ptot, dw, part,
                                             T=T, CS=CS, BT=BTB, EVR="evict_last" if EVICT else "",
-                                            EVS="evict_first" if EVICT else "")
+                                            EVS="evict_first" if EVICT else "",
+                                            inv=inv if inv is not None else sbag,
+                                            GSTRIDE=gg.shape[1] if inv is not None else 0)
     if SEG_LIST:   # the same sums over the rows that have partials only, found without a host sync
         multi = npiece > 1
         mrows = torch.argsort((~multi).to(torch.uint8), stable=True).to(torch.int32)   # those rows first, in order
@@ -275,6 +285,36 @@ def _compact(rows, cnt, off, cols, nbags, S: tl.constexpr, BB: tl.constexpr):
     k = tl.arange(0, S)
     m = bm[:, None] & (k[None, :] < c[:, None])
     tl.store(cols + o[:, None] + k[None, :], tl.load(rows + b[:, None] * S + k[None, :], mask=m, other=0), mask=m)
+
+
+def rows_grad16(gs, inv, rows, cnt, nnz, ev, nrows, T):
+    """NNUE_REL_GS16: the table's gradient from gs [nbags, L1] bf16 in sorted order (act_bwd's) through inv (side-row
+    -> sorted slot), for the rows rel_rows() gave the forward: RelSumRows.backward's compact and seg_grad on bf16 rows."""
+    ev.synchronize()
+    n = int(nnz[0])
+    nbags = rows.shape[0]
+    c64 = cnt.long()
+    off = (torch.cumsum(c64, 0) - c64).contiguous()
+    flat = torch.empty(n, dtype=torch.int32, device=gs.device)
+    _compact[(triton.cdiv(nbags, 16),)](rows, cnt, off, flat, nbags, S=rows.shape[1], BB=16)
+    return seg_grad(gs, flat, c64, nbags, nrows, inv=inv, T=T)
+
+
+def rel_sum_rows_nograd(w, rows, cnt, nbags, bf16=False):
+    """RelSumRows's forward without autograd (NNUE_REL_GS16): the sums, and (rows, cnt, nnz, ev) for rows_grad16."""
+    T, S = w.shape[1], rows.shape[1]
+    table = bf16_copy(w) if bf16 else w.detach().contiguous()
+    off = torch.arange(nbags, device=w.device, dtype=torch.int64) * S
+    # NNUE_REL_LANE16: the sums rounded to bf16 as they are stored (the fp32 sum of each bag, then one rounding)
+    out = torch.empty((nbags, T), dtype=torch.bfloat16 if LANE16 else torch.float32, device=w.device)
+    _rel_fwd[(triton.cdiv(nbags, BB), triton.cdiv(T, BT))](table, rows, off, cnt, out, nbags, T=T, BB=BB, BT=BT,
+                                                           EVR="evict_last" if EVICT else "",
+                                                           EVS="evict_first" if EVICT else "")
+    nnz = torch.empty(1, dtype=torch.int64, pin_memory=True)
+    nnz.copy_(cnt.sum(dtype=torch.int64).view(1), non_blocking=True)
+    ev = torch.cuda.Event()
+    ev.record()
+    return out, (rows, cnt, nnz, ev)
 
 
 class RelSumRows(torch.autograd.Function):
