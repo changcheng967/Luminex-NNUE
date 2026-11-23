@@ -38,6 +38,9 @@ Environment:
                          the bucket sort's inverse: no fp32 lane gradient written, half the bytes in _seg_piece.
                          NOT bit for bit (each lane gradient rounded to bf16 before the table's sums): proven
                          loss-equal on box 10 (DEVLOG section 26) before any run used it
+  NNUE_REL_LANE16 [0]    with NNUE_REL_GS16: 1 = the relation rows' lane sums stored in bf16 (each bag's fp32 sum,
+                         rounded once), as the feature layer's own sums are: half the bytes _rel_fwd writes and
+                         _ft_fwd and _act_bwd read. NOT bit for bit: proven loss-equal on box 10 (DEVLOG section 27)
   NNUE_REL_FUSED [1]     1: on a GPU, indices() as one compiled dense pass (the same rows in the same order);
                          0: the step-by-step version, which the CPU always runs
   NNUE_REL_JOIN [inplace]   how the sums meet the feature layer's lanes: inplace = one autograd function that adds

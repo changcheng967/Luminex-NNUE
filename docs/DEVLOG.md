@@ -1411,3 +1411,37 @@ How GS16 was checked:
 For a G9-like run this is about 108 steps/s of training and pauses about 7 s shorter each (on 77M held-out
 positions), roughly 102.7 -> 107 steps/s over a float phase. The cells, checks and logs are in the session notes,
 `speed3/`.
+
+## 27. The relation lane sums in bf16 (box 10, Nov 23)
+
+g17's trace (#7's trainer) shows the GPU saturated:
+
+| Stream | Busy, ms a step |
+| :--- | :--- |
+| main | 5.8 |
+| relation | 2.7 |
+| `ft_bwd` | 1.2 |
+
+The device is idle 0.21 ms of a 9.52 ms step, and the streams overlap only about 0.6 ms. Only less total GPU work
+makes a step shorter now.
+
+**`NNUE_REL_LANE16=1`** (with GS16) stores the relation rows' lane sums in bf16: each bag's fp32 sum, rounded once,
+as the feature layer's own sums already are. That halves 3 x 268 MB a step: `_rel_fwd`'s write, and the reads by
+`_ft_fwd`'s lane tiles and by `_act_bwd`. It is NOT bit for bit: x's lanes 0..255 see the rounded sum. On a real t91
+batch from gen768t_04 the loss moves 8.6e-5 relative.
+
+The loss-equality runs: two 20,000-step arms from gen768t_04 with LANE16, read against section 26's two exact arms
+(the same seed, data and cosine). LANE16's mean shift against the exact arms stays within their own spread on every
+line:
+
+| Line | LANE16's mean shift | The exact arms' spread (mean) |
+| :--- | :--- | :--- |
+| HEALTH | -7e-9 | 9.8e-8 |
+| DISJOINT | +1.5e-8 (-1.3e-7 at the end) | 2.8e-7 |
+| TREE | -1.1e-6 | 5.2e-6 |
+
+Against the GS16 arms the shifts are -2.8e-8, -5.1e-8 and +1.0e-6.
+
+**Speed on G9's mix, 1,000-step arms:** #7's flags 107.2, 107.4 -> + LANE16 111.3, 111.3 steps/s. The 20,000-step arms
+ran 112.3 and 112.4, against 107.3 for GS16 alone and 103.8 exact. With both new settings off, the files' digests
+equal G7's.

@@ -40,6 +40,7 @@ import triton.language as tl
 
 SEG_LIST = os.environ.get("NNUE_REL_SEGLIST", "0") == "1"   # seg_grad's join over the multi-piece rows only
 EVICT = os.environ.get("NNUE_EVICT", "0") == "1"   # L2 hints in _rel_fwd and _seg_piece: the same values
+LANE16 = os.environ.get("NNUE_REL_LANE16", "0") == "1"   # rel_sum_rows_nograd's sums in bf16 (with NNUE_REL_GS16)
 JNP = 1024   # _seg_join_list's programs a lane block (2,048 to 32,768 timed no faster on a t91 batch)
 
 BB = 32    # bags a program
@@ -66,7 +67,8 @@ def _rel_fwd(table, cols, off, cnt, out, nbags, T: tl.constexpr, BB: tl.constexp
         v = tl.load(table + col[:, None] * T + lanes[None, :], mask=km[:, None] & lm[None, :], other=0.0,
                     eviction_policy=EVR)
         acc += v.to(tl.float32)
-    tl.store(out + b[:, None] * T + lanes[None, :], acc, mask=bm[:, None] & lm[None, :], eviction_policy=EVS)
+    tl.store(out + b[:, None] * T + lanes[None, :], acc.to(out.dtype.element_ty), mask=bm[:, None] & lm[None, :],
+             eviction_policy=EVS)
 
 
 @triton.jit
@@ -303,7 +305,8 @@ def rel_sum_rows_nograd(w, rows, cnt, nbags, bf16=False):
     T, S = w.shape[1], rows.shape[1]
     table = bf16_copy(w) if bf16 else w.detach().contiguous()
     off = torch.arange(nbags, device=w.device, dtype=torch.int64) * S
-    out = torch.empty((nbags, T), dtype=torch.float32, device=w.device)
+    # NNUE_REL_LANE16: the sums rounded to bf16 as they are stored (the fp32 sum of each bag, then one rounding)
+    out = torch.empty((nbags, T), dtype=torch.bfloat16 if LANE16 else torch.float32, device=w.device)
     _rel_fwd[(triton.cdiv(nbags, BB), triton.cdiv(T, BT))](table, rows, off, cnt, out, nbags, T=T, BB=BB, BT=BT,
                                                            EVR="evict_last" if EVICT else "",
                                                            EVS="evict_first" if EVICT else "")

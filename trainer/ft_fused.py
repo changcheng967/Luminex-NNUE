@@ -160,7 +160,7 @@ def _lanes(lane, order, rows, rmask, cols, T: tl.constexpr):
     the sort), 0 on the other lanes: the tile's [BM, BN] share, and the mask of the lanes it covers."""
     orow = tl.load(order + rows, mask=rmask, other=0)
     m = rmask[:, None] & (cols < T)[None, :]
-    return tl.load(lane + orow[:, None] * T + cols[None, :], mask=m, other=0.0), orow, m
+    return tl.load(lane + orow[:, None] * T + cols[None, :], mask=m, other=0.0).to(tl.float32), orow, m
 
 
 @triton.jit
@@ -301,8 +301,8 @@ def lane_args(lanes, R, L1):
     lane, order = lanes
     if lane.dim() != 2 or lane.shape[0] != R or order.shape[0] != R or not 0 < lane.shape[1] <= L1:
         raise ValueError(f"lanes: {tuple(lane.shape)} sums and {order.shape[0]} sort slots for {R} side-rows of {L1}")
-    if lane.dtype != torch.float32:
-        raise ValueError(f"lanes: the sums must be fp32, not {lane.dtype}")
+    if lane.dtype not in (torch.float32, torch.bfloat16):   # bf16: NNUE_REL_LANE16
+        raise ValueError(f"lanes: the sums must be fp32 or bf16, not {lane.dtype}")
     return lane.contiguous(), order.contiguous(), lane.shape[1]
 
 
