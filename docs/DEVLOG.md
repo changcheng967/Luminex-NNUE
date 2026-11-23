@@ -1445,3 +1445,29 @@ Against the GS16 arms the shifts are -2.8e-8, -5.1e-8 and +1.0e-6.
 **Speed on G9's mix, 1,000-step arms:** #7's flags 107.2, 107.4 -> + LANE16 111.3, 111.3 steps/s. The 20,000-step arms
 ran 112.3 and 112.4, against 107.3 for GS16 alone and 103.8 exact. With both new settings off, the files' digests
 equal G7's.
+
+**The longer test (box 10, cell 8):** GS16 and LANE16 together against #6's exact flags, three times the horizon:
+60,000 steps from gen768t_04, a cosine of 60,000, the lines every 5,000, two exact and two candidate arms,
+interleaved. The candidate's mean shift against the exact arms:
+
+| Line | Candidate's mean shift | The exact arms' spread (mean) | End values, exact / candidate |
+| :--- | :--- | :--- | :--- |
+| HEALTH | +5.4e-8 (+1.0e-8 at the end) | 6.8e-8 | 0.001336 / 0.001336 |
+| DISJOINT | +3.4e-9 (-1.3e-7 at the end) | 2.4e-7 | 0.000904 / 0.000904 |
+| TREE | +4.7e-7 (-6.6e-7 at the end) | 4.3e-6 | 0.006069, 0.006068 / 0.006067, 0.006068 |
+
+Over the 60,000 steps the candidate ran 113.5 and 113.4 steps/s, the exact arms 106.0 and 106.0.
+
+**Measured and not adopted** (each exact, each checked in compiled mode against #7's trainer; `check_compiled.py`
+tolerates `dhead_p`'s gradient, which the compiled graph scatters with atomic adds, so it differs between two runs of
+the same trainer):
+- **The tail's dX GEMM (dL/dh = dzz @ Wcat) inside act_bwd.** A Triton dot equals cuBLAS's bf16 GEMM bit for bit
+  only when it takes the K residue first (136 = 8 + 8 x 16), the order CUTLASS's mainloop uses; the plain order
+  differs in 163 of 201M elements. Exact in the compiled path, but only 111.3 -> 112.0 steps/s: each sorted tile mixes
+  both halves of h, so it needs two dots, and they cost almost what the 403 MB write and read saved.
+- **One composed gs-row index for `_seg_piece`** instead of two dependent gathers: 111.3 -> 111.1.
+- **AMSGrad's maximum stored only where it moved:** 0.996 -> 0.969 ms of optimizer on a late-run state, 0.3% of a
+  step.
+
+What is left is tensor-core work: `_ft_fwd` 1.41 and `_ft_bwd` 1.15 ms a step, at about 45-55% of the bf16 peak.
+Triton's tile sweeps found nothing (wide tiles spill), so the next step is a hand-written feature-layer kernel.
