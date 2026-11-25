@@ -1471,3 +1471,52 @@ the same trainer):
 
 What is left is tensor-core work: `_ft_fwd` 1.41 and `_ft_bwd` 1.15 ms a step, at about 45-55% of the bf16 peak.
 Triton's tile sweeps found nothing (wide tiles spill), so the next step is a hand-written feature-layer kernel.
+
+## 28. The feature layer's 0/1 tile from one int64 a plane (box 12, Nov 25)
+
+Both feature-layer kernels build X, the side-rows' piece-square bits, in registers. Each plane was two int32 words a
+row, spread over the 64 squares with a select per element (`where(upper, hi, lo)`), then `& 1` and int -> fp32 ->
+bf16.
+
+**The staged test first (cell 10): the conversions are not the cost.** Builds without them are exact but barely
+faster:
+- the forward goes 1.436 -> 1.393 ms (a sign mask, bitcast to bf16);
+- the backward: no build is faster.
+
+The forward's diagnostics:
+
+| Variant | ms |
+| :--- | :--- |
+| the kernel | 1.436 |
+| no epilogue | 1.166 |
+| a constant tile (no build, no bitboard loads) | 1.119 |
+| both: the mma + weight-load floor | 0.776 |
+
+**The change.** A plane's 64 squares are one int64 in memory (lo | hi << 32), so the bf16 paths now load one int64 a row
+and build `((w >> j) & 1) * 0x3F80`, bitcast to bf16 (0x3F80 is bf16 1.0). There is no select and no conversion. The
+backward's block of BMF = 128 features is two planes: two int64 words a row and one select, instead of four int32 words
+and three. It runs at 8 warps (`FUSED_BWD`); with the old build, 8 warps gain nothing.
+
+| Kernel | Before | After |
+| :--- | :--- | :--- |
+| `_ft_fwd` | 1.436 ms | 1.302 ms |
+| `_ft_bwd` | 1.144 ms | 1.104 ms |
+
+The FP8 and interpreter paths keep the old build, as does any other BMF.
+
+**Exact:** X is 0/1 whichever way it is built, so every dot is the same.
+- The forward's sums and h are equal as bytes.
+- The backward's dW stays within the kernel's own run-to-run atomics noise (1.2e-7 against 8.9e-8, of 0.71).
+- `check_compiled.py` gives CHECK_COMPILED_EQUAL against #7's trainer: the loss, gs, db and every gradient. The
+  exceptions are the feature table's (fp32 atomics: 2.8e-14 of 2.3e-7) and `dhead_p`'s (atomics).
+
+**Speed on G9's mix, 1,000-step arms, interleaved: #7 111.4, 111.4 -> 113.1, 113.2 steps/s (x1.016, 0.138 ms a
+step).** The forward alone gave 112.9, 112.9. The backward's 0.040 ms is worth only 0.017 ms of a step, because its
+stream overlaps the others.
+
+**Tile settings for the new builds:** #7's are still the best.
+- Forward: BM 128, BN 128, 4 warps, 2 stages, 1.304 ms. Every other shape is slower.
+- Backward: BK 32, BN 128, 8 warps, 1.105-1.108 ms at 3-5 stages.
+
+**What is left:** the forward's 1.30 ms against its 0.78 ms floor, mostly the epilogue's two bf16 stores. Closing it
+needs a hand-written kernel.

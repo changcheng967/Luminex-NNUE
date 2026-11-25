@@ -184,23 +184,31 @@ def _ft_fwd(planes, ranges, w, bias, wscale, out, wlo, dst, h, lane, order, NB0,
     acc = tl.zeros((BM, BN), dtype=tl.float32)
     wrow = w + kb * (768 * L1)
     wrow_lo = wlo + kb * (768 * L1)
+    p64 = planes.to(tl.pointer_type(tl.int64))   # box 12: each plane's 64 squares as one int64 (lo | hi << 32)
+    j64 = j.to(tl.int64)
     for p in range(12):
-        lo = tl.load(planes + rows * 24 + 2 * p, mask=rmask, other=0)
-        hi = tl.load(planes + rows * 24 + 2 * p + 1, mask=rmask, other=0)
-        word = tl.where(upper[None, :], hi[:, None], lo[:, None])
-        bit = ((word >> sh[None, :]) & 1).to(tl.float32)
         k = p * 64 + j
         wt = tl.load(wrow + k[:, None] * L1 + cols[None, :], eviction_policy=EVW)
         if FP8:
+            lo = tl.load(planes + rows * 24 + 2 * p, mask=rmask, other=0)
+            hi = tl.load(planes + rows * 24 + 2 * p + 1, mask=rmask, other=0)
+            word = tl.where(upper[None, :], hi[:, None], lo[:, None])
+            bit = ((word >> sh[None, :]) & 1).to(tl.float32)
             acc = tl.dot(bit.to(tl.float8e4nv), wt, acc)
         elif INTERP:   # Triton's CPU interpreter gets bf16 dots wrong (3.8.0); the same values in fp32 there
+            lo = tl.load(planes + rows * 24 + 2 * p, mask=rmask, other=0)
+            hi = tl.load(planes + rows * 24 + 2 * p + 1, mask=rmask, other=0)
+            word = tl.where(upper[None, :], hi[:, None], lo[:, None])
+            bit = ((word >> sh[None, :]) & 1).to(tl.float32)
             acc = tl.dot(bit, wt.to(tl.float32), acc)
             if SPLIT:
                 acc = tl.dot(bit, tl.load(wrow_lo + k[:, None] * L1 + cols[None, :]).to(tl.float32), acc)
-        else:
-            acc = tl.dot(bit.to(tl.bfloat16), wt, acc)
+        else:   # box 12 (cell 12, XB 5): one int64 load a row, the 0/1 tile built without a select or conversions
+            w64 = tl.load(p64 + rows * 12 + p, mask=rmask, other=0)
+            xb = (((w64[:, None] >> j64[None, :]) & 1) * 16256).to(tl.int16).to(tl.bfloat16, bitcast=True)
+            acc = tl.dot(xb, wt, acc)
             if SPLIT:   # the rest of each weight: hi + lo is exact (split_bf16)
-                acc = tl.dot(bit.to(tl.bfloat16), tl.load(wrow_lo + k[:, None] * L1 + cols[None, :]), acc)
+                acc = tl.dot(xb, tl.load(wrow_lo + k[:, None] * L1 + cols[None, :]), acc)
     if FP8:
         acc = acc * tl.load(wscale + cols)[None, :]
     if ACT:   # the sums without the bias (act_bwd's x), then bias + SCReLU into each row's half of h
@@ -244,26 +252,37 @@ def _ft_bwd(planes, ranges, g, gscale, dw,
     fl = tl.arange(0, BMF)   # feature within this block: word fl // 32, bit fl % 32
     wl = fl // 32
     sh = fl & 31
+    hl = fl // 64            # box 12 (cell 14): with BMF = 128, int64 word fl // 64 of the block, bit fl % 64
+    sh64 = (fl & 63).to(tl.int64)
+    p64 = planes.to(tl.pointer_type(tl.int64))
     cols = nb * BN + tl.arange(0, BN)
     acc = tl.zeros((BMF, BN), dtype=tl.float32)
     for r in range(r0, r1, BK):
         rows = (r + tl.arange(0, BK)).to(tl.int64)
         rmask = rows < r1
-        # only the block's NW distinct words per row are loaded ([BK] each), then spread over
-        # the 32 features each one holds: no [BMF, BK] gather (it repeated every word 32 times)
-        word = tl.zeros((BMF, BK), dtype=tl.int32)
-        for i in tl.static_range(NW):
-            wi = tl.load(planes + rows * 24 + (fb * NW + i), mask=rmask, other=0)
-            word = tl.where((wl == i)[:, None], wi[None, :], word)
-        bit = ((word >> sh[:, None]) & 1).to(tl.float32)              # X^T tile [BMF, BK]
-        gt = tl.load(g + rows[:, None] * L1 + cols[None, :], mask=rmask[:, None], other=0.0)
-        if FP8:
-            s = tl.load(gscale + rows, mask=rmask, other=0.0)
-            acc = tl.dot((bit * s[None, :]).to(tl.float8e4nv), gt, acc)
-        elif INTERP:   # the interpreter's bf16 dot, as in _ft_fwd
-            acc = tl.dot(bit, gt.to(tl.float32), acc)
+        if BMF == 128 and not FP8 and not INTERP:   # box 12: two int64 words a row, one select, no conversions
+            wa = tl.load(p64 + rows * 12 + 2 * fb, mask=rmask, other=0)
+            wb = tl.load(p64 + rows * 12 + 2 * fb + 1, mask=rmask, other=0)
+            w64 = tl.where((hl == 0)[:, None], wa[None, :], wb[None, :])
+            xb = (((w64 >> sh64[:, None]) & 1) * 16256).to(tl.int16).to(tl.bfloat16, bitcast=True)
+            gt = tl.load(g + rows[:, None] * L1 + cols[None, :], mask=rmask[:, None], other=0.0)
+            acc = tl.dot(xb, gt, acc)
         else:
-            acc = tl.dot(bit.to(tl.bfloat16), gt, acc)
+            # only the block's NW distinct words per row are loaded ([BK] each), then spread over
+            # the 32 features each one holds: no [BMF, BK] gather (it repeated every word 32 times)
+            word = tl.zeros((BMF, BK), dtype=tl.int32)
+            for i in tl.static_range(NW):
+                wi = tl.load(planes + rows * 24 + (fb * NW + i), mask=rmask, other=0)
+                word = tl.where((wl == i)[:, None], wi[None, :], word)
+            bit = ((word >> sh[:, None]) & 1).to(tl.float32)              # X^T tile [BMF, BK]
+            gt = tl.load(g + rows[:, None] * L1 + cols[None, :], mask=rmask[:, None], other=0.0)
+            if FP8:
+                s = tl.load(gscale + rows, mask=rmask, other=0.0)
+                acc = tl.dot((bit * s[None, :]).to(tl.float8e4nv), gt, acc)
+            elif INTERP:   # the interpreter's bf16 dot, as in _ft_fwd
+                acc = tl.dot(bit, gt.to(tl.float32), acc)
+            else:
+                acc = tl.dot(bit.to(tl.bfloat16), gt, acc)
     dst = dw + (kb * 768 + fb * BMF + fl)[:, None] * L1 + cols[None, :]
     tl.atomic_add(dst, acc, sem="relaxed")
 
