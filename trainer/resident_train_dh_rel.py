@@ -1140,7 +1140,7 @@ if FT_DENSE == 3:
     if (QAT or QAT_AFTER) and FT_FP8:
         raise SystemExit('NNUE_FT_FP8 has no QAT path: QAT needs the exact sums of the bf16 split forward')
     FUSED_FWD = dict(BM=128, BN=128, num_warps=4, num_stages=2)    # best of the 2026-11-12 sweeps: 1.247 ms
-    FUSED_BWD = dict(BMF=128, BN=128, BK=32, num_warps=4, num_stages=4)
+    FUSED_BWD = dict(BMF=128, BN=128, BK=32, num_warps=8, num_stages=4)   # box 12 (cell 14): 8 warps with the int64 build
     FUSED_CH = 8192
 
 
