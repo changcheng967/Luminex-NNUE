@@ -28,8 +28,10 @@ Splits and side files:
 Files per input member: MEMBER.lcr, MEMBER.val.lcr and their .aux.tsv.gz. manifest.tsv gets one line a member, and
 --skip-done skips members it already lists, so a growing archive converts in passes.
 
-usage: pgn2lcr.py OUT_DIR INPUT [INPUT ...] [--hold N] [--skip-done]
+usage: pgn2lcr.py OUT_DIR INPUT [INPUT ...] [--hold N] [--skip-done] [--part K/N]
   INPUT: an OpenBench archive (.tar of .pgn.bz2 members), a .pgn.bz2 or a .pgn
+  --part K/N: this process takes every N-th member from the K-th (0-based), so N processes share an archive; they
+              append to one manifest, one line a member.
 """
 import bz2, gzip, hashlib, os, re, struct, sys, tarfile, time, zlib
 
@@ -156,21 +158,24 @@ def convert(name, text, out, hold, stats):
 
 def main():
     args = sys.argv[1:]
-    hold, skip_done = 20, False
+    hold, skip_done, part, parts = 20, False, 0, 1
     if "--hold" in args:
         i = args.index("--hold"); hold = int(args[i + 1]); del args[i:i + 2]
     if "--skip-done" in args:
         args.remove("--skip-done"); skip_done = True
+    if "--part" in args:   # K/N: this process takes the members whose index is K modulo N
+        i = args.index("--part"); part, parts = map(int, args[i + 1].split("/")); del args[i:i + 2]
     if len(args) < 2:
         sys.exit(__doc__)
     out, inputs = args[0], args[1:]
     os.makedirs(out, exist_ok=True)
     man = f"{out}/manifest.tsv"
     done = {l.split("\t")[0] for l in open(man)} if skip_done and os.path.exists(man) else set()
-    stats, t0 = {}, time.time()
+    stats, t0, seen = {}, time.time(), [0]
 
     def one(name, raw):
-        if name in done:
+        seen[0] += 1
+        if (seen[0] - 1) % parts != part or name in done:
             return
         text = (bz2.decompress(raw) if raw[:3] == b"BZh" else raw).decode("utf-8", "replace")
         n, sha = convert(name, text, out, hold, stats)
