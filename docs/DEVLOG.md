@@ -1345,7 +1345,17 @@ rel_rows.py 9f878c07. The checks, cells and logs are in the session notes, `spee
 ## 26. What the V5 runs gave: six networks, five SPRTs passed (G5-G10, Nov 18-24)
 
 V5 is gen768t: HalfKAv2_hm with 32 king buckets x 768 features, plus 55,960 int8 relation rows summed into 256 of
-the 768 lanes, on the x2048 grid. From G6 on, each run starts from the previous network's float weights with a fresh
+the 768 lanes, on the x2048 grid.
+
+**The relation rows are not a first.** They are pairwise attacker/defender features, the idea of threat inputs:
+- Stockfish's Full_Threats (SFNNv10, commit 8e5392d, November 2025; it credits Monty #87 from December 2024, Yukari
+  and PlentyChess #400/#411) adds 59,808 int8 rows of the same kind, and PlentyChess, Viridithas, Stormphrax,
+  Berserk, Caissa, Integral and Triumviratus have threat tables too.
+- The "pawn pairs in contact" rows overlap Stockfish's PP_3Wide, which came from Pawnocchio.
+- Ours are the set of relations, its encoding into 256 of the lanes and the measurements. This credit was found by a
+  prior-art check on 2026-11-27, after the runs.
+
+From G6 on, each run starts from the previous network's float weights with a fresh
 optimizer and a new cosine. The data is Leela's, relabelled by BT4: t91's monthly binpacks and the BT4 corpus files.
 Each run ends in 30,000 QAT steps and an LNT8 written twice, byte-identical. Every SPRT ran on OpenBench
 (bench.luminexchess.com) at 10+0.1 with bounds [0, 5]. The Elo values are as the tests' pages give them; games and
