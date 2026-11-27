@@ -65,6 +65,14 @@ Environment (default in brackets):
                      engine evaluates
   NNUE_VAL_MAX [5e6] positions of NNUE_VAL_DATA (and of NNUE_VAL_TREE) to load: a binpack's
                      first whole chunks, so a large file is never read whole
+  NNUE_OWN_DATA      LCR1 file(s) or globs of our own labelled positions (pgn2lcr.py's MEMBER.lcr),
+                     kept whole on the GPU beside the training data
+  NNUE_OWN_SHARE [0] the share of every batch taken from NNUE_OWN_DATA: the batch's last
+                     round(share x NNUE_BS) rows become own records drawn uniformly with
+                     replacement (generator seed NNUE_OWN_SEED [306]). At 0 nothing is loaded
+                     and the batches are the trainer's own, bit for bit
+  NNUE_VAL_OWN       LCR1 file(s) of own games the run never trains on (pgn2lcr.py's
+                     MEMBER.val.lcr): an [OWN] line with [DISJOINT]'s fields beside it
   NNUE_EVAL_EVERY [1000] steps between [HEALTH] validation lines
   NNUE_SAVE_EVERY [3000] steps between checkpoint saves
   NNUE_KEEP_EVERY [0 = off] steps between numbered copies of the float net
@@ -194,6 +202,10 @@ PROGRESS = {"t": time.time(), "step": 0}   # the last finished training step (th
 VAL_DATA = env("NNUE_VAL_DATA", "")
 VAL_TREE = env("NNUE_VAL_TREE", "")
 VAL_MAX = int(float(env("NNUE_VAL_MAX", "5e6")))
+OWN_DATA = env("NNUE_OWN_DATA", "")
+OWN_SHARE = float(env("NNUE_OWN_SHARE", "0"))
+OWN_SEED = int(env("NNUE_OWN_SEED", "306"))
+VAL_OWN = env("NNUE_VAL_OWN", "")
 EVAL_EVERY = int(env("NNUE_EVAL_EVERY", "1000"))
 SAVE_EVERY = int(env("NNUE_SAVE_EVERY", "3000"))
 KEEP_EVERY = int(env("NNUE_KEEP_EVERY", "0"))
@@ -1751,6 +1763,33 @@ def main():
         feeder = PoolFeeder(train, host, SEED, BS) if host is not None else None
     dval = held_out_set(VAL_DATA, "NNUE_VAL_DATA", files, "game-disjoint")
     tval = held_out_set(VAL_TREE, "NNUE_VAL_TREE", files, "search-tree")
+    own, own_k, own_gen, own_files = None, 0, None, []
+    if OWN_SHARE > 0:   # our own labelled positions, a fixed share of every batch (pgn2lcr.py's records)
+        own_files = data_files(OWN_DATA)
+        if not own_files or not all(os.path.exists(p) for p in own_files):
+            raise SystemExit(f"FAIL: NNUE_OWN_SHARE {OWN_SHARE} needs NNUE_OWN_DATA; {OWN_DATA!r} not found")
+        if set(map(os.path.realpath, own_files)) & set(map(os.path.realpath, files)):
+            raise SystemExit("FAIL: NNUE_OWN_DATA shares files with the training data")
+        own = load_records(own_files, 1 << 40, "own")   # every record (the cap keeps count x 32 inside int64)
+        own_k = int(round(OWN_SHARE * BS))
+        if not 0 < own_k < BS:
+            raise SystemExit(f"FAIL: NNUE_OWN_SHARE {OWN_SHARE} gives {own_k} of {BS} rows a batch")
+        own_gen = torch.Generator(device=dev)
+        own_gen.manual_seed(OWN_SEED)
+        cls = ((own[:, 26] >> 1) & 3).long()
+        res = torch.where(((own[:, 26] >> 3) & 1) == 1, ((own[:, 26] >> 4) & 3).long(), 3)
+        t_max = int(float(env("NNUE_T_MAX_STEPS", "0")))
+        print(f"[own] {len(own):,} records from {len(own_files)} file(s) | quiet {int((cls == 0).sum()):,}, capture "
+              f"{int((cls == 1).sum()):,}, check {int((cls == 2).sum()):,}; side to move won {int((res == 2).sum()):,}, "
+              f"drew {int((res == 1).sum()):,}, lost {int((res == 0).sum()):,}, unknown {int((res == 3).sum()):,} | "
+              f"share {OWN_SHARE}: {own_k} of {BS} rows a batch, seed {OWN_SEED}"
+              + (f", about {own_k * t_max / len(own):.1f} draws a record over {t_max:,} steps" if t_max else ""), flush=True)
+        mc = material_check(own)
+        print("  [OWN] material check (quiet own positions labelled beyond +800 for the side up): "
+              + ", ".join(f"{k} up {s:.0%} (of {c:,})" for k, (c, s) in mc.items()), flush=True)
+        if mc["queen"][0] >= 100 and not mc["queen"][1] >= 0.9:
+            raise SystemExit("FAIL: the own records' labels do not value material (a queen up must read as won)")
+    oval = held_out_set(VAL_OWN, "NNUE_VAL_OWN", files + own_files, "own held-out")
     shuffle = HostShuffle(n, SEED) if feeder is None else None
 
     model = LNNUE(L1=L1).to(dev)
@@ -1891,6 +1930,9 @@ def main():
             perm = shuffle.next_pass() if feeder is None else None
             for i in range(0, steps_per_pass * BS, BS):
                 batch = feeder.next()[0] if feeder is not None else train[HostShuffle.batch(perm, i, BS)]
+                if own is not None:   # NNUE_OWN_SHARE: the batch's last own_k rows become own records
+                    batch = torch.cat((batch[:BS - own_k],
+                                       own[torch.randint(len(own), (own_k,), device=dev, generator=own_gen)]))
                 loss = step_fn(model, batch)
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
@@ -1944,8 +1986,9 @@ def main():
                     _t2 = time.time()
                     evaluate_disjoint(model, tval, gstep, "TREE")
                     _t3 = time.time()
-                    print(f"  [gate time] HEALTH {_t1 - _tg:.2f} s, DISJOINT {_t2 - _t1:.2f} s, TREE {_t3 - _t2:.2f} s",
-                          flush=True)
+                    evaluate_disjoint(model, oval, gstep, "OWN")   # NNUE_VAL_OWN: our own held-out games
+                    print(f"  [gate time] HEALTH {_t1 - _tg:.2f} s, DISJOINT {_t2 - _t1:.2f} s, TREE {_t3 - _t2:.2f} s"
+                          + (f", OWN {time.time() - _t3:.2f} s" if oval is not None else ""), flush=True)
                 if sess % phase["save"] == 0:
                     _ts = time.time()
                     save("checkpoint")
@@ -1964,6 +2007,7 @@ def main():
         evaluate(model, val, gstep)
         evaluate_disjoint(model, dval, gstep)
         evaluate_disjoint(model, tval, gstep, "TREE")
+        evaluate_disjoint(model, oval, gstep, "OWN")
         save("final")
         print(f"DONE ({done}) - {phase['out']}: {gstep} steps, {(gstep - seg0) * BS:,} positions in "
               f"{time.time() - t_begin:.0f} s ({(gstep - seg0) / (time.time() - t0):.2f} steps/s)", flush=True)
@@ -1972,6 +2016,7 @@ def main():
     evaluate(model, val, gstep)   # the starting point, for the curve
     evaluate_disjoint(model, dval, gstep)
     evaluate_disjoint(model, tval, gstep, "TREE")
+    evaluate_disjoint(model, oval, gstep, "OWN")
     stall_watchdog(feeder)
     done = run_phase()
     if env("NNUE_EVAL_FENS", "") and done != "profile":   # V6 gate night: the instruments' evaluations
@@ -2006,6 +2051,7 @@ def main():
         evaluate(model, val, gstep)   # the QAT net before its first step
         evaluate_disjoint(model, dval, gstep)
         evaluate_disjoint(model, tval, gstep, "TREE")
+        evaluate_disjoint(model, oval, gstep, "OWN")
         run_phase()
 
 if __name__ == "__main__":
