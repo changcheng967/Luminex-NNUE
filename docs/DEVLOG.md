@@ -1417,7 +1417,8 @@ measurements. The engine support is changcheng967/Luminex#148.
 ## 28. Own game data: the pilot and the tools (DATAGEN 306 and 315, Nov 26-27)
 
 **The labeller** is our engine's own search, at 100,000 nodes a move in self-play (OpenBench DATAGEN, the
-DatagenInfo option). The engine's UCI cp is its Value unchanged, and Value is the net's output x 300, the trainer's
+DatagenInfo option). That is the count as the engine kept it then: until changcheng967/Luminex#157 every horizon
+node was counted twice, so these are about 79,000 real nodes. The engine's UCI cp is its Value unchanged, and Value is the net's output x 300, the trainer's
 target unit. So the labels sit on the binpacks' scale.
 
 **The pilot, DATAGEN 306:** 19,075 games, 2.6M positions.
@@ -1437,4 +1438,26 @@ target unit. So the labels sit on the binpacks' scale.
 **DATAGEN 315** plays 290,000 games with 306's settings. Its first 202,240 games convert to 27.57M records: 26.2M for
 training and 1.36M held out by game. The first own-label gate (control, 1% and 3% shares, the control again on a
 second seed) is gate night 4, registered in the engine repo's V6 design notes (6.3) before it ran, on G10's 17
-binpacks without Chess960. Its results follow here.
+binpacks without Chess960.
+
+**Gate night 4** (box 15, Nov 27 21:09 to Nov 28 01:35 UTC): five arms of 250,000 steps from u01 (PB3's float), each
+scored against the control of its seed.
+
+| Arm | Own share | Seed | [OWN] loss | own_ref6000: rho v SF19 | tree sample |
+|---|---|---|---|---|---|
+| OWNC2 (the control again) | 0 | 21 | +0.06% | -0.0003 | -0.11% |
+| OWN1 | 1% | 19 | -3.06% | +0.0038 | -0.26% |
+| OWN1B (against OWNC2) | 1% | 21 | -3.04% | +0.0036 | -0.40% |
+| OWN3 | 3% | 19 | -4.60% | +0.0051 | -0.56% |
+
+- [OWN] is the trainer's loss on 315's 9,949 held-out games. own_ref6000 is 6,000 of 306's positions with Stockfish
+  19's value at 1M nodes. The tree sample is 80,000 positions from our engine's search trees, with BT4 labels.
+- **Own data passes the registered rule at both shares, and the 1% effect repeats on the second seed.**
+- The gain is in endgames: own_ref6000's endgame rho rises +0.019 at 1% and +0.027 at 3%, its middlegames +0.0002
+  and +0.0004. Leela's positions (gap_ref6000) gain in endgames too, +0.0056 at 1%.
+- 3% starts to cost on held-out Leela positions: HEALTH +0.44% and DISJOINT +0.21% (+0.08% and -0.01% at 1%). The
+  games sample moves +0.41% on the seed alone, more than any arm's effect there.
+- The next full run takes 2%: each measure fitted as a quadratic in the share through the two points, the tree gain
+  against each cost has its optimum between 1.8% and 2.2%.
+- The rest of 315's archive so far (413 members, 264,320 games) is converted: 62,080 more games, 8.48M more
+  records.
