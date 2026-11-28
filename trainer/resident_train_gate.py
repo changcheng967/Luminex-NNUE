@@ -119,6 +119,11 @@ Environment (default in brackets):
                      bf16 weight gradient with fp32 accumulation. With NNUE_QAT the forward is
                      exact: each rounded weight split into two bf16 parts that sum to it, two
                      dots into one fp32 accumulator, fp32 out (the engine's int16 sums, as =2)
+  NNUE_QAT_SPLIT [1] with NNUE_QAT and NNUE_FT_DENSE=3 (not NNUE_QAT_FT8): the table's rounding to the
+                     engine's grid and its split into two bf16 parts in one kernel
+                     (ft_fused.qat_split_bf16) instead of qat_ft's straight-through chain and
+                     split_bf16's casts (eight passes over the table); the same bits, the same
+                     gradient (the straight-through gradient is the identity); 0 = the chain
   NNUE_FT_FP8 [0]    with NNUE_FT_DENSE=3: 1 = the weight gradient in FP8 (G in e4m3, one
                      global scale and a power-of-two boost per row), 2 = the forward too
                      (the table in e4m3 with a scale per column); 0 = bf16 both ways
@@ -246,6 +251,15 @@ FT_DENSE = int(env("NNUE_FT_DENSE", "0"))
 FT_TILE = int(env("NNUE_FT_TILE", "1024"))
 FT_FP8 = int(env("NNUE_FT_FP8", "0"))
 FT_ACT = FT_DENSE == 3 and env("NNUE_FT_ACT", "1") == "1"
+QAT_SPLIT = FT_DENSE == 3 and not QAT_FT8 and env("NNUE_QAT_SPLIT", "1") == "1"
+
+
+def qat_split():
+    """True when the fused kernels get the table as the run holds it and round it themselves (NNUE_QAT_SPLIT);
+    read at call time: NNUE_QAT_AFTER turns QAT on between the phases."""
+    return QAT and QAT_SPLIT
+
+
 PROFILE = int(env("NNUE_PROFILE", "0"))
 PROFILE_WARMUP = int(env("NNUE_PROFILE_WARMUP", "300"))
 FT_TF32 = env("NNUE_FT_TF32", "1") == "1"
@@ -1216,7 +1230,10 @@ def ft_sums(planes_s, rf, weight, bias, act=None, lanes=None, **kw):
     if kw and (QAT or FT_FP8 >= 2):
         raise ValueError("ft_sums: out, h and nb in the bf16 forward only")
     if QAT:   # exact: hi + lo is the rounded weight, the sums fp32
-        hi, lo = FF.split_bf16(weight[:NUM_INPUTS].float())
+        if qat_split():   # the table as the run holds it: one kernel rounds it to the grid and splits it
+            hi, lo = FF.qat_split_bf16(weight[:NUM_INPUTS], FT_GRID)
+        else:             # weight comes rounded (qat_ft)
+            hi, lo = FF.split_bf16(weight[:NUM_INPUTS].float())
         return FF.ft_fwd(planes_s, rf, hi, bias, w_lo=lo, act=act, lanes=lanes, **FUSED_FWD)
     if FT_FP8 >= 2:   # the table in e4m3, scaled per column
         w8, wsc = FF.fp8_cols(weight[:NUM_INPUTS])
@@ -1356,7 +1373,7 @@ def ft_fused(wf, bf, weight):
     the kernels itself (ft_fused_act: it needs the bias and the side to move); this returns ()."""
     if FT_ACT:
         return ()
-    return FusedFT.apply(wf, bf, qat_ft(weight) if QAT else weight)
+    return FusedFT.apply(wf, bf, qat_ft(weight) if QAT and not qat_split() else weight)
 
 
 # Extra lane sums for the fused activation: None, or a function of no arguments that returns
@@ -1380,8 +1397,8 @@ def ft_fused_act(wf, bf, stm, weight, bias):
             ev.record()
         return FusedAct.apply(wf, bf, weight.detach(), bias, stm, lane, ev, (weight,))
     lane = LANE_SUMS() if LANE_SUMS is not None else None
-    if QAT:
-        return FusedAct.apply(wf, bf, qat_ft(weight), qat_bias(bias), stm, lane)
+    if QAT:   # NNUE_QAT_SPLIT: the kernels round the table themselves (ft_sums), the gradient goes to it directly
+        return FusedAct.apply(wf, bf, weight if qat_split() else qat_ft(weight), qat_bias(bias), stm, lane)
     return FusedAct.apply(wf, bf, weight, bias, stm, lane)
 
 
