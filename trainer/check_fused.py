@@ -122,13 +122,17 @@ def gradients(data, ckpt, fp8=0, qat=False):
                        and bool(torch.equal(torch.round(bq * grid), bq * grid)))
             hi, lo = RT.FF.split_bf16(wq[:RT.NUM_INPUTS].float())
             split_ok = torch.equal(hi.float() + lo.float(), wq[:RT.NUM_INPUTS].float())
+            # NNUE_QAT_SPLIT's one kernel on the unrounded table: the same bits as the chain's rounding and split
+            hs, ls = RT.FF.qat_split_bf16(model.ft.weight[:RT.NUM_INPUTS], grid)
+            split_ok = split_ok and torch.equal(hs.view(torch.int16), hi.view(torch.int16)) \
+                and torch.equal(ls.view(torch.int16), lo.view(torch.int16))
             fw, fb = RT.ft_fused(wf, bf, model.ft.weight)
             dw, db = RT.ft_dense(wf, wq), RT.ft_dense(bf, wq)
             same = torch.equal(fw, dw) and torch.equal(fb, db)
             worst = max(float((fw - dw).abs().max()), float((fb - db).abs().max()))
         exact = on_grid and split_ok and same and fw.dtype == torch.float32
         print(f"  QAT feature layer: weights and bias on the engine's grid x{grid:g}: {on_grid}; "
-              f"hi + lo == the rounded table: {split_ok}; fused == dense fp32 bit for bit: "
+              f"hi + lo == the rounded table, qat_split_bf16 the same bits: {split_ok}; fused == dense fp32 bit for bit: "
               f"{same} (largest difference {worst:.3e}, fused dtype {fw.dtype}; "
               f"|table| <= {float(wq.abs().max()):.4f})", flush=True)
         del model

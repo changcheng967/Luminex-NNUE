@@ -387,6 +387,37 @@ def split_bf16(w):
     return hi.contiguous(), (w - hi.float()).to(torch.bfloat16).contiguous()
 
 
+try:
+    from triton.language.extra import libdevice as _libdevice
+except ImportError:   # Triton before 3.0
+    from triton.language.extra.cuda import libdevice as _libdevice
+
+
+@triton.jit
+def _qat_split(w_ptr, hi_ptr, lo_ptr, N, G: tl.constexpr, BLOCK: tl.constexpr):
+    offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    m = offs < N
+    w = tl.load(w_ptr + offs, mask=m, other=0.0)
+    q = tl.div_rn(_libdevice.rint(w * G), G)   # torch.round(w * G) / G: half to even, an exact division
+    q = w + (q - w)   # the straight-through add, kept: it equals q but for the sign of a zero (-0.0 -> +0.0)
+    hi = q.to(tl.bfloat16)
+    tl.store(hi_ptr + offs, hi, mask=m)
+    tl.store(lo_ptr + offs, (q - hi.to(tl.float32)).to(tl.bfloat16), mask=m)
+
+
+def qat_split_bf16(w, grid, BLOCK=4096):
+    """split_bf16 of QAT's rounded table in one pass: w [NI, L1] fp32 as the run holds it -> (hi, lo) bf16 with
+    hi + lo == torch.round(w * grid) / grid exactly. The same bits as split_bf16(w + (torch.round(w * grid) / grid
+    - w).detach()), QAT's straight-through rounding (its add is exact: Sterbenz), from one read of w where that
+    chain makes eight elementwise passes over the table. The caller's autograd edge goes to w itself: the
+    straight-through gradient is the identity."""
+    w = w.contiguous()
+    hi = torch.empty(w.shape, dtype=torch.bfloat16, device=w.device)
+    lo = torch.empty_like(hi)
+    _qat_split[(triton.cdiv(w.numel(), BLOCK),)](w, hi, lo, w.numel(), G=float(grid), BLOCK=BLOCK)
+    return hi, lo
+
+
 def ft_bwd(planes_s, ranges, g_s, dw, BMF, BN, BK, fp8=False, gscale=None, num_warps=8, num_stages=3):
     """Adds X^T G into dw [32 * 768, L1] fp32 (zero it first). g_s: [R, L1] bf16 in sorted
     order (or e4m3 with gscale [R] fp32, see fp8_rows); ranges from plan(kb, CH)."""
