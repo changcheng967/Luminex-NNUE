@@ -1341,3 +1341,123 @@ Measured and dropped:
 trainer/ now holds what runs/g7 ran, plus these settings. A run turns them on in its cell and pins the files by
 SHA-256: resident_train_dh_rel.py 408fc5ae, ft_fused.py 4f1680c6, rel_gate.py 02c52adc, rel_kernels.py 8fd55ee8,
 rel_rows.py 9f878c07. The checks, cells and logs are in the session notes, `speed2/`.
+
+## 26. What the V5 runs gave: six networks, five SPRTs passed (G5-G10, Nov 18-24)
+
+V5 is gen768t: HalfKAv2_hm with 32 king buckets x 768 features, plus 55,960 int8 relation rows summed into 256 of
+the 768 lanes, on the x2048 grid.
+
+**The relation rows are not a first.** They are pairwise attacker/defender features, the idea of threat inputs:
+- Stockfish's Full_Threats (SFNNv10, commit 8e5392d, November 2025; it credits Monty #87 from December 2024, Yukari
+  and PlentyChess #400/#411) adds 59,808 int8 rows of the same kind, and PlentyChess, Viridithas, Stormphrax,
+  Berserk, Caissa, Integral and Triumviratus have threat tables too.
+- The "pawn pairs in contact" rows overlap Stockfish's PP_3Wide, which came from Pawnocchio.
+- Ours are the set of relations, its encoding into 256 of the lanes and the measurements. This credit was found by a
+  prior-art check on 2026-11-27, after the runs.
+
+From G6 on, each run starts from the previous network's float weights with a fresh
+optimizer and a new cosine. The data is Leela's, relabelled by BT4: t91's monthly binpacks and the BT4 corpus files.
+Each run ends in 30,000 QAT steps and an LNT8 written twice, byte-identical. Every SPRT ran on OpenBench
+(bench.luminexchess.com) at 10+0.1 with bounds [0, 5]. The Elo values are as the tests' pages give them; games and
+W/L/D are from OpenBench's rows.
+
+| Run | Network (OpenBench id) | Float phase | TREE loss against its start | SPRT | Registered |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| G5 | gen768t_01q (87E4A40F) | 450K steps, the gate's arm T1 | | test 173 against its control gen768s_05q: **+37.91 +- 10.32** (1,058 games, 210/95/753); test 174 against main's gen768s_03q: **+73.37 +- 14.20** (668 games) | about +60 against the control: missed low |
+| G6 | gen768t_02q (40443DF6) | 1,142,724 steps from gen768t_01 | | test 176 against 01q: **+28.93 +- 9.30** (1,300 games, 222/114/964, LLR 2.99) | +40: missed low |
+| G7 | gen768t_03q (F9CAA986) | 2,614,140 steps from 02 | -4.2% | test 195 against 02q: **+18.53 +- 7.54** (2,158 games, 382/267/1,509, LLR 2.98) | +22 (+17 to +28): inside |
+| G8 | gen768t_04q (D955D5A2) | 2,497,248 steps from 03 | -2.63% | test 200 against 03q: **+7.22 +- 4.37** (5,916 games, 892/769/4,255, LLR 2.97) | +10: inside |
+| G9 | gen768t_05q (1D9F4460) | 2,693,718 steps from 04 | -1.33% | test 264 against 04q: **+9.86 +- 5.07** (3,876 games, 549/439/2,888, LLR 3.00) | +10 (+4 to +18): at the centre |
+| G10 | gen768t_06q (BB1DCFC7) | 2,631,204 steps from 05 | +0.67% | test 292 against 05q: **failed**, 49.62% (about -2.7) over 9,422 games (1,435/1,507/6,480, LLR -3.00) | +5 (+1 to +10): refuted |
+
+05q has been main's network since changcheng967/Luminex#130. What the six runs taught:
+- **The search-tree loss (TREE) tracked the SPRTs; the game-position loss (DISJOINT) did not.** G8 got worse on game
+  positions (DISJOINT +1.99%) and passed. G10 got much better on them (-5.95%) and failed, its TREE loss up 0.67%.
+- **Predictions from the loss came in high at first, then on target.** G5 and G6 fell short of theirs, G7-G9 landed
+  inside, and G10's came from the games sample alone, which did not convert.
+- **A 25,000-node match only catches a broken net.** It orders runs at about twice an SPRT's error: G8 -4.17 +-
+  10.80, G9 +8.69 +- 10.79, G10 -0.00 +- 10.39.
+
+## 27. V6's first change in games: a feature table per game phase (PB3 -> u01q, Nov 24-27)
+
+**What it is:** PB3 copies the feature table once per phase block, by the number of men on the board: 26-32, 13-25 and
+2-12. That makes 96 "king buckets" of 768 rows (NI 73,728). The relation rows, the feature bias and the tails stay
+single. Piece-count buckets on the input layer were published first by Triumviratus 8.0 ("Consilium", 4 material
+bands on top of king buckets), so PB3 is not a novelty of ours. Ours are the code, the 26/13 bands, the
+function-preserving start (each phase a copy of the previous table, so step 0 is the old net exactly) and the
+measurements. The engine support is changcheng967/Luminex#148.
+
+**The steps:**
+- **The gate** (250K steps from gen768t_06, against the same arm without PB3): games sample -1.93%
+  [-2.37, -1.44], tree sample -0.63% [-0.84, -0.43].
+- **The full run, gen768u_01:** 06 + 1,900,000 steps on G10's data plus t91's Chess960 binpacks. It ran on two boxes:
+  the second resumed the first's checkpoint at step 650,000 with its optimizer and schedule.
+  - The trainer's gates against 05: TREE -1.11%, DISJOINT -9.05%.
+  - Against the gate's control: games -3.48% [-4.25, -2.65], tree -1.75% [-2.13, -1.33].
+  - Separation of decided positions from draws was untouched.
+- **gen768u_01q (842BC7D2)**, after G10's QAT:
+  - QAT's DISJOINT is +0.66% over the float, as G6's and G7's were. The LNT8 is 127.8 MB.
+  - Exact in the engine: LUMINEX_REL_CHECK=3 found 0 inexact lanes of 3.36 billion; the lanes equal the integer
+    reference at 1,301 positions across both phase crossings; nnuecheck gives one digest at every SIMD level.
+- **In games, against 05q:**
+
+  | Measure | Result | Registered |
+  | :--- | :--- | :--- |
+  | 25K nodes | +27.16 +- 11.02 (2,000 games) | +18 |
+  | Test 319, 10+0.1 | **+7.49 +- 4.44** (5,520 games, 847/728/3,945, LLR 2.96) | +14 (+3 to +28) |
+  | Test 320, 60+0.6 | **+6.60 +- 5.95** (2,000 games, 210/172/1,618) | about +8 (0 to +16) |
+
+  - The speed price is about 2% (0.98 of 05q's nps).
+  - u01q ships in v6.7.0.
+- **Chess960 data is dropped from later runs** (2026-11-27, the user's word): our engine plays standard chess only,
+  and no measurement showed it helped.
+- **QAT speed:** PB3's QAT runs with NNUE_FT_DENSE=3 from now on: 1.54x the steps a second, loss-equal over 6,000
+  steps against a repeat of the old setting.
+
+## 28. Own game data: the pilot and the tools (DATAGEN 306 and 315, Nov 26-27)
+
+**The labeller** is our engine's own search, at 100,000 nodes a move in self-play (OpenBench DATAGEN, the
+DatagenInfo option). That is the count as the engine kept it then: until changcheng967/Luminex#157 every horizon
+node was counted twice, so these are about 79,000 real nodes. The engine's UCI cp is its Value unchanged, and Value is the net's output x 300, the trainer's
+target unit. So the labels sit on the binpacks' scale.
+
+**The pilot, DATAGEN 306:** 19,075 games, 2.6M positions.
+- On 6,000 of our own positions, our in-game label agrees with Stockfish 19 at 1M nodes at rho 0.928.
+- A fresh 100K search scores 0.923 there: the game's hash is free depth. 400K adds only +0.009, at 4x the fleet time.
+- The fleet makes 1.42M kept positions an hour on 64 slots.
+
+**The tools, on branch own-data:**
+- `trainer/pgn2lcr.py` turns datagen PGNs into LCR1 records, binpack2lcr's layout. It holds out whole games, 1 in 20,
+  and keeps DatagenInfo's other fields in a side file.
+- `trainer/check_pgn2lcr.py` replays the games with python-chess and checks every field of random records with a
+  decoder of its own.
+- `trainer/resident_train_gate.py` is the V6 gate trainer, plus a fixed share of each batch from own records
+  (NNUE_OWN_DATA, NNUE_OWN_SHARE) and an [OWN] gate on held-out own games (NNUE_VAL_OWN). At share 0 it trains bit for
+  bit as before (checked on the CPU over 40 steps).
+
+**DATAGEN 315** plays 290,000 games with 306's settings. Its first 202,240 games convert to 27.57M records: 26.2M for
+training and 1.36M held out by game. The first own-label gate (control, 1% and 3% shares, the control again on a
+second seed) is gate night 4, registered in the engine repo's V6 design notes (6.3) before it ran, on G10's 17
+binpacks without Chess960.
+
+**Gate night 4** (box 15, Nov 27 21:09 to Nov 28 01:35 UTC): five arms of 250,000 steps from u01 (PB3's float), each
+scored against the control of its seed.
+
+| Arm | Own share | Seed | [OWN] loss | own_ref6000: rho v SF19 | tree sample |
+|---|---|---|---|---|---|
+| OWNC2 (the control again) | 0 | 21 | +0.06% | -0.0003 | -0.11% |
+| OWN1 | 1% | 19 | -3.06% | +0.0038 | -0.26% |
+| OWN1B (against OWNC2) | 1% | 21 | -3.04% | +0.0036 | -0.40% |
+| OWN3 | 3% | 19 | -4.60% | +0.0051 | -0.56% |
+
+- [OWN] is the trainer's loss on 315's 9,949 held-out games. own_ref6000 is 6,000 of 306's positions with Stockfish
+  19's value at 1M nodes. The tree sample is 80,000 positions from our engine's search trees, with BT4 labels.
+- **Own data passes the registered rule at both shares, and the 1% effect repeats on the second seed.**
+- The gain is in endgames: own_ref6000's endgame rho rises +0.019 at 1% and +0.027 at 3%, its middlegames +0.0002
+  and +0.0004. Leela's positions (gap_ref6000) gain in endgames too, +0.0056 at 1%.
+- 3% starts to cost on held-out Leela positions: HEALTH +0.44% and DISJOINT +0.21% (+0.08% and -0.01% at 1%). The
+  games sample moves +0.41% on the seed alone, more than any arm's effect there.
+- The next full run takes 2%: each measure fitted as a quadratic in the share through the two points, the tree gain
+  against each cost has its optimum between 1.8% and 2.2%.
+- The rest of 315's archive so far (413 members, 264,320 games) is converted: 62,080 more games, 8.48M more
+  records.
